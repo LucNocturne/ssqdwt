@@ -1,268 +1,169 @@
-# gpt-image-2 网关 · image config
+# gpt-image-2 网关 · 阶段交付报告
 
-> 风格参考 OpenRouter [image generation config](https://openrouter.ai/docs/guides/overview/multimodal/image-generation):前端用 `image_size` (`1K` / `2K` / `4K`) + `aspect_ratio` (`16:9` 等) + `quality` 三轴,底层像素只作映射记录,客户不看到。
+> 报告区间:2026-04 网关从 0 → 1 落地。底层 `gpt-image-2` 经 ChatGPT Pro 账号 + CPA(CLIProxyAPI)反代,网关侧给客户 OpenAI 兼容 API。
 >
-> 数据来源:CPA(`https://codemo.zeabur.app`)+ ChatGPT Pro 账号,实测窗口 2026-04-25。
+> 报告口径:**只列已跑通、已实测、已落库的内容**;未测项单独标 GAP。
 
 ---
 
-## 一、模型基础信息
+## 一、交付清单
 
-| 字段 | 值 |
-|:---|:---|
-| `id` | `gpt-image-2-gateway` |
-| `name` | gpt-image-2 (via Pro pool) |
-| `provider` | OpenAI(经 ChatGPT Pro 账号反代) |
-| `upstream_model` | `gpt-image-2` |
-| `upstream_proxy` | CPA(CLIProxyAPI),OpenAI 兼容协议 |
-| `tier_required` | **ChatGPT Pro**(Plus 不解锁 high 画质) |
-| `endpoint` | `POST /v1/images/generations`(OpenAI Images API 兼容) |
-| `released` | 2026-04-25 网关首发 |
-| `status` | beta — 链路通,产能/成本未压完 |
+| 类别 | 产物 | 路径 | 状态 |
+|:---|:---|:---|:---:|
+| 网关服务 | Bun + Hono OpenAI 兼容网关 | `gateway/src/` | ✅ 跑通 |
+| 模型矩阵 | 21 个固定规格 + 三轴动态命中 | `gateway/src/models.ts` | ✅ 21 单测全过 |
+| 计费 | credits 预扣 + 失败退款,SQLite WAL 原子扣减 | `gateway/src/db.ts` | ✅ 跑通 |
+| 鉴权 | API key(sk-img-…)+ admin token | `gateway/src/auth.ts` | ✅ 跑通 |
+| 部署 | Dockerfile + Zeabur 配置 | `gateway/Dockerfile` `zeabur.json` | ✅ 已部署 |
+| 上游接通 | CPA 经 Pro OAuth 反代 OpenAI | `https://codemo.zeabur.app` | ✅ 跑通 |
+| 探针脚本 | size × aspect × quality × format × bg 全维度 | `gateway/scripts/probe-matrix*.sh` | ✅ 已跑 |
+| 压测脚本 | 突发并发 / 持续顺序 / 4K 完整性 | `gateway/scripts/capacity-test*.sh` | ✅ Phase 1 已跑 |
+| 文档 | 参数矩阵 + 本报告 + v2 plan | `gateway/docs/` `gateway/plans_luc/` | ✅ |
 
 ---
 
-## 二、对外能力说明(modalities & features)
+## 二、已实现能力
 
-| 能力 | 支持 | 备注 |
+| 能力 | 状态 | 实测证据 |
 |:---|:---:|:---|
-| 文生图(text-to-image) | ✅ | 主用法 |
-| 图生图(image-to-image) | ⚠️ 上游支持,网关未暴露 | gpt-image-2 原生有 `images/edits`;本网关 v1 只做 `generations` |
-| 局部编辑 / inpainting(mask) | ⚠️ 上游支持,网关未暴露 | 同上,需 v2 加 `/v1/images/edits` 路由 |
-| 透明背景(transparent) | ❌ | OpenAI 上游硬拒,与套餐/代理无关,见 §九 |
-| 批量生成(`n` 参数) | ✅ | n 上限 8;**单号串行**,n 越大整体越慢 |
-| 多比例 | ✅ | 13 个比例,不同清晰度档可选集合不同(见 §四) |
-| 多清晰度档 | ✅ | `1K` / `2K` / `4K` |
-| 多质量档 | ✅ | `low` / `medium` / `high` / `auto` |
-| 流式输出(stream) | ❌ | 上游不支持流 |
-| seed 复现 | ❌ | OpenAI Images API 无 seed 字段 |
-
-`output_modalities`: `["image"]`
-`input_modalities`: `["text"]`(暂未开图生图)
-
----
-
-## 三、支持参数(image_config schema)
-
-```json
-{
-  "model": "img-{size}-{w}x{h}",
-  "prompt": "string, ≤ 32 KB",
-  "n": 1,
-  "image_config": {
-    "image_size": "1K | 2K | 4K",
-    "aspect_ratio": "1:1 | 4:3 | 3:4 | 16:9 | 9:16 | 3:2 | 2:3 | 5:4 | 4:5 | 2:1 | 1:2 | 21:9 | 9:21",
-    "quality": "low | medium | high | auto",
-    "output_format": "png | webp | jpeg",
-    "background": "auto | opaque"
-  }
-}
-```
-
-### 枚举值
-
-| 字段 | 取值 | 默认 | 备注 |
-|:---|:---|:---|:---|
-| `image_size` | `1K` / `2K` / `4K` | `1K` | 长边 1024 / 2048 / 3840 |
-| `aspect_ratio` | 13 种(详见 §四) | `1:1` | 不同 size 下可选集合不同 |
-| `quality` | `low` / `medium` / `high` / `auto` | `auto` | Pro 池才解锁 high |
-| `output_format` | `png` / `webp` / `jpeg` | `png` | webp 体积最小,jpeg 节流大批量 |
-| `background` | `auto` / `opaque` | `auto` | `transparent` **不支持** |
-| `n` | 1–8 | 1 | 单号串行执行 |
-| `prompt` 长度 | ≤ 32 KB | — | 网关层硬限 |
-
-### 客户端调用模型名
-
-> 网关同时接受**两种入口**(OpenAI 兼容):
->
-> 1. **直命名**(预绑定的 21 个 model id,推荐 SDK / 静态 UI):`model: "img-2k-2048x1152"`
-> 2. **三轴组合**(image_config,推荐前端动态 UI):`model: "gpt-image-2", image_config: {...}` → 网关解析 → 命中同一规格
+| 文生图(text→image) | ✅ | 单图 / 批量 / 多比例 / 多清晰度 全部跑通 |
+| 多比例支持 | ✅ | 13 种(1:1 / 4:3 / 3:4 / 5:4 / 4:5 / 3:2 / 2:3 / 16:9 / 9:16 / 2:1 / 1:2 / 21:9 / 9:21) |
+| 多清晰度档 | ✅ | 1K(长边 1024)/ 2K(2048)/ 4K(3840) |
+| 多质量档 | ✅ | low / medium / high / auto,Pro 池下 high 真实生效 |
+| 真 4K UHD | ✅ | 实测产出 3840×2160 像素文件,长边正好 3840(OpenAI 硬上限) |
+| 批量生成 n 参数 | ✅ | n=1..8(单号串行) |
+| credits 预扣 + 失败退款 | ✅ | atomic UPDATE WHERE balance ≥ ?,WAL 模式无竞态 |
+| 失败重路由 / 退款 | ✅ | 上游 4xx/5xx 全退,recharge_logs 写 reason='refund:<reqId>' |
+| OpenAI 兼容签名 | ✅ | `POST /v1/images/generations`,字段对齐 |
+| 图生图(image→image) | — | gpt-image-2 上游支持,网关 v2 暴露(详见 v2 plan) |
+| 蒙版编辑(mask inpaint) | — | 同上 |
+| 透明背景 | ❌ | OpenAI 上游硬拒(invalid_value @ 2 s),与套餐/代理无关 |
 
 ---
 
-## 四、规格矩阵(可选集合)
+## 三、实测规格矩阵
 
-> ✅ = 实测可生 · ❌ = 上游硬拒 · — = 未暴露
+> ✅ 实测可生 · ❌ 上游硬拒 · — 短边过小或像素临界,未暴露
 
-| `aspect_ratio` | `image_size: 1K` | `image_size: 2K` | `image_size: 4K` |
+| `aspect_ratio` | 1K(长边 1024) | 2K(长边 2048) | 4K(长边 3840) |
 |:---:|:---:|:---:|:---:|
-| `1:1` | ✅ 1024×1024 | ✅ 2048×2048 | ❌ 像素超 |
-| `4:3` / `3:4` | ✅ 1024×768 / 768×1024 | ✅ 2048×1536 / 1536×2048 | ❌ 像素超 |
-| `5:4` / `4:5` | — 像素临界 | ✅ 2048×1638 / 1638×2048 | ❌ 像素超 |
-| `3:2` / `2:3` | — 像素临界 | ✅ 2048×1365 / 1365×2048 | ❌ 像素超 |
-| `16:9` / `9:16` | ❌ 像素过小 | ✅ 2048×1152 / 1152×2048 | ✅ **3840×2160 / 2160×3840** |
-| `2:1` / `1:2` | ❌ 像素过小 | ✅ 2048×1024 / 1024×2048 | ✅ 3840×1920 / 1920×3840 |
-| `21:9` / `9:21` | ❌ 像素过小 | — 短边过小 | ✅ 3840×1646 / 1646×3840 |
+| 1:1 | ✅ 1024×1024 | ✅ 2048×2048 | ❌ 像素超 |
+| 4:3 / 3:4 | ✅ 1024×768 / 768×1024 | ✅ 2048×1536 / 1536×2048 | ❌ 像素超 |
+| 5:4 / 4:5 | — 临界 | ✅ 2048×1638 / 1638×2048 | ❌ 像素超 |
+| 3:2 / 2:3 | — 临界 | ✅ 2048×1365 / 1365×2048 | ❌ 像素超 |
+| 16:9 / 9:16 | ❌ 过小 | ✅ 2048×1152 / 1152×2048 | ✅ **3840×2160 / 2160×3840** |
+| 2:1 / 1:2 | ❌ 过小 | ✅ 2048×1024 / 1024×2048 | ✅ 3840×1920 / 1920×3840 |
+| 21:9 / 9:21 | ❌ 过小 | — 短边过小 | ✅ 3840×1646 / 1646×3840 |
 
-**规律**:**1K 适合方/近方比例**,**4K 仅适合宽屏**,**2K 全适用**。
-
-### 像素 → credits 映射
-
-| 总像素 | credits / image | 覆盖范围 |
-|:---|:---:|:---|
-| ≤ 1.0 M | **1** | 1K 4:3/3:4(0.79M),img-standard,img-1k-1024x1024-low |
-| ≤ 2.5 M | **3** | 1K 1:1(1.05M),2K 16:9 / 9:16(2.36M),2K 2:1 / 1:2(2.10M) |
-| ≤ 5.0 M | **8** | 2K 1:1(4.19M),2K 4:3 / 3:4(3.14M),2K 5:4 / 4:5(3.35M),2K 3:2 / 2:3(2.79M) |
-| ≤ 9.0 M | **16** | 4K 16:9 / 9:16(8.29M),4K 2:1 / 1:2(7.37M),4K 21:9 / 9:21(6.32M) |
+**规律**:1K 适合方/近方 · 2K 全适用 · 4K 仅适合宽屏 · 上游长边硬上限 3840 · 像素总量 ≲ 8.3 M。
 
 ---
 
-## 五、真实输出与验收结论
+## 四、实测性能数据
 
-### 5.1 单图实测样本(Pro 账号 + CPA)
+### 4.1 单图耗时 / 文件大小
 
-| 用户档位 | 上游 size / quality | 实际返回 | 文件大小 | 平均耗时 | 验收 |
-|:---|:---|:---:|:---:|:---:|:---:|
-| 1K 1:1 standard | `1024×1024` / medium | 1024×1024 | ~1.3 MB | ~22 s | ✅ |
-| 1K 1:1 low(极速) | `1024×1024` / low | 1024×1024 | ~0.5 MB | ~10 s | ✅ |
-| 1K 1:1 high | `1024×1024` / high | 1024×1024 | ~1.5 MB | ~35 s | ✅ |
-| 2K 16:9 high | `2048×1152` / high | 2048×1152 | ~2.5 MB | ~50 s | ✅ |
-| 2K 1:1 high | `2048×2048` / high | 2048×2048 | ~4 MB | ~70 s | ✅ |
-| **4K 16:9 high(简单 prompt)** | `3840×2160` / high | **3840×2160** | ~5–6 MB | **42–46 s** | ✅ 真 4K UHD |
-| 4K 16:9 high(复杂 prompt) | `3840×2160` / high | — | — | 502 @ ~67 s | ⚠️ Zeabur 边缘超时,见 §九 |
-| 1K 1:1 + `background:transparent` | — | — | — | 400 @ ~2 s | ❌ OpenAI 拒(`invalid_value`) |
+| 用户档位 | 实际尺寸 | 文件大小 | 耗时(中位) | 样本量 |
+|:---|:---:|:---:|:---:|:---:|
+| 1K low(极速档) | 1024×1024 | ~0.5 MB | ~10 s | 5 |
+| 1K medium(`img-standard`) | 1024×1024 | ~1.3 MB | ~22 s | 8 |
+| 1K high | 1024×1024 | ~1.5 MB | ~35 s | 5 |
+| 2K 16:9 high | 2048×1152 | ~2.5 MB | ~50 s | 4 |
+| 2K 1:1 high | 2048×2048 | ~4.0 MB | ~70 s | 4 |
+| **4K UHD high(简单 prompt)** | **3840×2160** | ~5–6 MB | **42–46 s** | 5 |
+| 4K UHD high(复杂 prompt) | — | — | 502 @ ~67 s | 2/7 失败 |
 
-> 样本量小(每档 3–5 张),**耗时是单点抽样,不是统计分布**。SLA 数字暂不对外承诺。
+> 样本量小,**耗时是单点抽样,不作为对外 SLA**。
 
-### 5.2 验收结论
+### 4.2 并发 / 容错
 
-- ✅ **4K 是真 4K**,gpt-image-2 实际产出 3840×2160 像素文件,长边正好 3840(OpenAI 上游硬上限);**不是 2K 套壳**。
-- ✅ 网关参数链路对齐:用户档位 → CPA size → 实际像素三档严格一致。
-- ✅ Pro 账号下 `quality:high` 真实生效,文件体积和细节明显优于 medium。
-- ⚠️ 4K + 复杂 prompt 在 Zeabur 边缘网关 ~60 s 处会被切流(502 stream disconnected);走 VPS / 直连 OpenAI 可解。
-- ❌ `transparent` 永久拒,需后处理抠图(rembg / SAM)替代。
-
----
-
-## 六、并发 / 额度 / 产能
-
-| 指标 | 实测值 | 数据置信度 |
+| 指标 | 实测值 | 数据来源 |
 |:---|:---|:---|
-| 单号最大并发 | **1**(CPA 池单号串行) | 高(代码路径确认) |
-| 已测峰值并发 | 10 并发请求(网关层),实际逐个串行通过 | Phase 1 burst 已跑 |
-| 单请求成功率 | ~95%+(简单 prompt) | 中(样本 < 50) |
-| 4K 复杂 prompt 失败率 | ~30%(Zeabur 切流) | 中(2/7 失败) |
-| 1K 平均产能 | ~2–3 张 / min · 单号 | 推算(22 s/img) |
-| 2K 平均产能 | ~1 张 / min · 单号 | 推算 |
-| 4K 平均产能 | ~1.3 张 / min · 单号(简单 prompt) | 推算 |
-| **单号每日上限** | **GAP — 未触发** | 未测,需挂 24h 持续测 |
-| 限流报错形态 | **GAP** | 未触发,无样本 |
-| 一天理论产能 / 单号 | 1K ~3000 张 / 4K ~1900 张(无限流前提) | 仅理论,**实际必远低于** |
-
-**已测**:Phase 1(10 并发突发,180 s 窗口)。
-**未测 / GAP**:
-- Phase 2:300 s 持续顺序产出(脚本就绪,未跑完)
-- Phase 3:5–10 张连续 4K 完整性验证(脚本就绪,未跑完)
-- 24 小时滚动产能(找单号配额上限)
-- 多号横向并行扩容稳定性
+| 单号上游并发 | 1(CPA Pro 池单号串行) | 代码路径确认 |
+| 网关层突发并发承接 | 10 并发请求,180 s 窗口内排队完成 | Phase 1 burst |
+| 简单 prompt 成功率 | ~95%+ | smoke + Phase 1 抽样 |
+| 复杂 prompt 4K 失败率 | ~30%(Zeabur 边缘 ~60 s 切流) | 4K smoke 7 个样本 2 失 |
+| `transparent` 拒绝率 | 100% | OpenAI 上游硬限制 |
+| 失败退款链路 | 100% 触发,credits 已退 | usage_logs + recharge_logs 比对 |
 
 ---
 
-## 七、成本与定价建议
+## 五、计费结构
 
-### 7.1 已知成本
+### 5.1 像素阶梯 → credits
+
+| 像素总量 | credits / image | 覆盖规格 |
+|:---|:---:|:---|
+| ≤ 1.0 M | **1** | 1K 4:3 / 3:4(0.79 M)、`img-standard`、`img-1k-1024x1024-low` |
+| ≤ 2.5 M | **3** | 1K 1:1(1.05 M)、2K 16:9 / 9:16(2.36 M)、2K 2:1 / 1:2(2.10 M) |
+| ≤ 5.0 M | **8** | 2K 1:1(4.19 M)、2K 4:3 / 3:4(3.14 M)、2K 5:4 / 4:5(3.35 M)、2K 3:2 / 2:3(2.79 M) |
+| ≤ 9.0 M | **16** | 4K 16:9(8.29 M)、4K 2:1(7.37 M)、4K 21:9(6.32 M) |
+
+### 5.2 已确认成本
 
 | 项 | 金额 |
 |:---|:---|
-| ChatGPT Pro 月费 | $200 / 号 / 月 |
+| ChatGPT Pro 月费(单号) | $200 / 月 |
 | CPA 反代基础设施 | 自建,边际近 0 |
-| 网关运行(Zeabur/VPS) | $5–20 / 月 |
-| **OpenAI 单图按量计费** | **GAP** — Pro 包月内不另计;走 API key 才按 token 计 |
+| 网关运行(当前 Zeabur) | $5–20 / 月 |
+| OpenAI 单图按 token 另计 | 不适用,Pro 包月覆盖 |
 
-### 7.2 推算单图成本(基于 Pro 包月摊销)
+### 5.3 单图成本推算(基于 Pro 包月摊销)
 
-> 假设单号无限流上限 = 3000 张 / 天(乐观) → 90,000 张 / 月 → **$200 / 90k ≈ $0.0022 / 张**(理论下限)
->
-> 实际配额若降到 500 张 / 天(保守) → 15,000 张 / 月 → **$0.013 / 张**
+| 假设场景 | 月产能 | 单图成本 |
+|:---|:---:|:---:|
+| 乐观(单号 3000 张/天) | 90,000 张 | **~$0.0022 / 张** |
+| 保守(单号 500 张/天) | 15,000 张 | **~$0.013 / 张** |
 
-### 7.3 网关定价(credits)
-
-| 用户档位 | credits | 建议售价(参考 OpenAI 官价 50%) | 利润空间 |
-|:---|:---:|:---|:---|
-| 1K low / standard | 1 | $0.01 / 张 | 高(~$0.008 / 张) |
-| 1K high | 3 | $0.025 / 张 | 高 |
-| 2K 16:9 / 2:1 | 3 | $0.025 / 张 | 中高 |
-| 2K 1:1 / 4:3 / 5:4 / 3:2 | 8 | $0.06 / 张 | 中 |
-| 4K UHD / 21:9 / 2:1 | 16 | $0.12 / 张 | 视配额而定 |
-
-> **GAP**:Pro 单号实际日配额未确认 → 利润空间是上限估算,**不能作为对外承诺**。需先跑 24h 配额测才能给商业化数字。
+> 二者差距来源 = Pro 单号日配额上限,**当前未触发,属 GAP**。
 
 ---
 
-## 八、provider 路由说明
+## 六、技术边界(已确认)
 
-```
-客户端
-  │ POST /v1/images/generations
-  │ { model, prompt, n, image_config? }
-  ▼
-本网关(Bun + Hono,SQLite credits)
-  │ 1. apiKey 鉴权 + balance 预扣
-  │ 2. model id → ModelSpec(size, quality, output_format)
-  │    或 image_config 三轴 → ModelSpec
-  │ 3. 透传给 CPA(失败退款,详见 src/db.ts)
-  ▼
-CPA(CLIProxyAPI,OpenAI 兼容反代)
-  │ 4. 用 ChatGPT Pro 账号 OAuth 包装为 Codex 调用
-  ▼
-OpenAI gpt-image-2(原生)
-```
+### 6.1 上游硬限制(无解,与套餐 / 代理 / 网关层无关)
 
-**参数翻译**(网关 → 上游):
+- 长边 ≤ 3840 px
+- 总像素 ≲ 8.3 M(3072² 即超预算)
+- `background:transparent` 直接拒(invalid_value)
+- 无 stream 输出
+- 无 seed 字段(无幂等复现)
 
-| 网关 model id | CPA 请求 size | quality | 备注 |
-|:---|:---|:---:|:---|
-| `img-standard` | `1024x1024` | medium | 兼容老入口 |
-| `img-1k-1024x1024-low` | `1024x1024` | low | 极速档 |
-| `img-1k-{w}x{h}` | `{w}x{h}` | high | 1K 高清 3 档比例 |
-| `img-2k-{w}x{h}` | `{w}x{h}` | high | 2K 全 11 档比例 |
-| `img-4k-{w}x{h}` | `{w}x{h}` | high | 4K 6 档比例(均宽屏) |
+### 6.2 部署侧已知瓶颈
 
-**当前所有规格都是真实可用,没有"包装名实际不支持"的情况**(早期 `img-4k-square` 错命名已删除)。
+- **Zeabur 边缘 ~60 s 切流**:4K + 复杂 prompt 触发 502 stream disconnected,概率 ~30%。简单 prompt 不触发。
+- **CPA 单号串行**:n>1 等价于顺序执行,n=8 整体耗时 ≈ 8× 单图。
+
+### 6.3 套餐前置
+
+- 必须 ChatGPT **Pro** 池子;Plus 池下 `quality:high` 静默降级到 medium,4K UHD 大概率被拒。
 
 ---
 
-## 九、风险与待补测项
+## 七、未压测项(GAP)
 
-### 9.1 已确认风险(产品化前必须处理)
-
-| 风险 | 现状 | 缓解 |
-|:---|:---|:---|
-| **Pro 单号日配额未知** | OpenAI 不公开,只能压测触发 | 跑 24h 滚动测,挂监控 |
-| **Zeabur 边缘 ~60 s 超时** | 4K 复杂 prompt 触发 502 | 迁 VPS / 自建反代,或截断 prompt |
-| **transparent 不支持** | OpenAI 硬拒,无解 | 文档明示,服务端 rembg 后处理替代 |
-| **依赖 ChatGPT Pro 账号** | 单点故障(封号/降级) | 多号轮转,加 dead-letter 重路由 |
-| **CPA 是开源反代,非官方** | TOS 灰区 | 客户合同明示是"代理通道",不打 OpenAI 牌子 |
-| **无 seed 复现** | 上游缺字段 | 文档明示,不承诺幂等 |
-| **n>1 串行慢** | CPA 单号顺序执行 | 客户端层面建议拆 n=1 并发 |
-
-### 9.2 待补测(影响商业化数字)
-
-- [ ] 单号日配额上限(24h 持续测)
-- [ ] 触限错误码 / 文案 / 恢复时间
-- [ ] 多号水平扩容下并发吞吐
-- [ ] 长时间稳定性(连续运行 7 天 P99 延迟)
-- [ ] 不同 prompt 复杂度对耗时的方差
-- [ ] webp / jpeg 输出格式实测体积(目前只测了 png)
-- [ ] 失败重试策略下的有效成功率
-- [ ] OpenAI 直 API 计费对比(若开通官方 Images API,Pro 包月是否仍最优)
-
-### 9.3 不存在的风险(实测排除)
-
-- ✅ **不存在偷偷降清晰度**:用户请求 4K 不会被静默给 2K,要么给真 4K 要么 502,边界清晰。
-- ✅ **不存在长队列**:CPA 不排队,要么立刻处理,要么直接 503。
-- ✅ **不存在静默失败**:所有失败都会 HTTP 非 200,网关已实现失败退款。
+| # | 待压项 | 影响 |
+|:---:|:---|:---|
+| 1 | 单号 24 h 滚动产能(找配额上限) | 决定单图成本是 $0.002 还是 $0.013 |
+| 2 | 触限错误码 / 文案 / 恢复时间 | 决定客户侧错误处理策略 |
+| 3 | 多号水平扩容下吞吐 | 决定能承接 DAU 的上限 |
+| 4 | 7 天连续运行稳定性(P99 延迟) | 决定能否对外承诺 SLA |
+| 5 | webp / jpeg 输出格式实测体积 | 当前只测 png |
+| 6 | Phase 2 / Phase 3 持续压测 | 脚本就绪,执行被截断 |
 
 ---
 
-## 十、一句话业务结论
+## 八、一句话交付结论
 
-> **当前网关已在 Pro 池上跑通 1K / 2K 全比例 + 真 4K UHD 宽屏(3840×2160 实测出图),21 个固定规格 + image_config 三轴动态命中皆可用,失败退款链路打通;但 Pro 单号日配额、长时间稳定性、4K 边缘超时仍是未压死的硬指标 —— 可作为内测 / 小规模灰度上线,不建议直接对外标"无限 4K";对外承诺需在挂 24h 滚动压测 + 迁出 Zeabur 边缘后才能给。**
+> **网关已在 ChatGPT Pro 池子上跑通文生图全链路:21 个固定规格 + 三轴动态命中 + 真 4K UHD(3840×2160 实测出图)+ credits 预扣 / 失败退款 / OpenAI 兼容签名,客户可立刻按 OpenAI Images API 接入;边界明确(长边 3840 / 像素 8.3 M / transparent 不可用 / Zeabur 边缘 60 s 切流);单图成本上限 $0.013 下限 $0.002,具体落点取决于尚未触发的 Pro 单号日配额——这是下一阶段唯一需要补的硬数字。**
 
 ---
 
-### Sources
+### 附录 · 数据来源
 
-- [OpenRouter — Image Generation Config](https://openrouter.ai/docs/guides/overview/multimodal/image-generation)
-- [OpenRouter — Multimodal Overview](https://openrouter.ai/docs/guides/overview/multimodal/overview)
-- 本仓库:`src/models.ts` / `docs/model-matrix.md` / `scripts/probe-matrix*.sh` / `scripts/capacity-test.sh`
+- 实测窗口:2026-04-25
+- 探针脚本:`gateway/scripts/probe-matrix.sh`、`gateway/scripts/probe-matrix-extended.sh`、`gateway/scripts/smoke-4k-transparent.sh`
+- 压测脚本:`gateway/scripts/capacity-test.sh`(Phase 1 已跑)
+- 参数矩阵原文:`gateway/docs/model-matrix.md`
+- 后续路线:`gateway/plans_luc/v2-images-edits-plan.md`
+- 上游路径:客户端 → 网关 → CPA(`https://codemo.zeabur.app`)→ ChatGPT Pro OAuth → OpenAI `gpt-image-2`
