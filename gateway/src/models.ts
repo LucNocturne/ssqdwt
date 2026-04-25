@@ -1,23 +1,77 @@
 /**
- * 对外暴露的"模型规格名" → 上游 CPA 参数 的映射。
+ * 模型规格 = 分辨率 × 比例 的派生组合,不再硬编码命名 spec。
  *
- * 客户看到的是 OpenAI 风格的 model name;网关内部把它翻译成 CPA 的
- * (size, quality, output_format) 一组参数,顺便决定计费倍率。
+ * 客户调用:`model: "img-{resolution}-{aspect}"`,例如 `img-2k-16x9`。
+ * 网关内部 (resolution, aspect) → CPA size 参数。
  *
- * gpt-image-2 实测硬限制(2026-04-25 在 Pro 账号):
- *   - 最长边 ≤ 3840 px
- *   - 总像素 ≲ 8.3M(3072x3072 已超预算)
- *   - background:"transparent" OpenAI 上游硬拒绝(任何套餐都不行)
+ * 真值表(2026-04-25 实测 gpt-image-2 经 CPA + Pro 账号):
  *
- * 单图成本(credits)按总像素阶梯定:
- *   img-standard    1   (1M px,medium)
- *   img-hd          3   (1M px,high)
- *   img-2k-square   8   (4.2M px,high)  — 之前误名 img-4k-square
- *   img-uhd-16x9   16   (8.3M px,真 4K UHD 横版)
- *   img-uhd-9x16   16   (8.3M px,真 4K UHD 竖版)
+ *           1x1   4x3   3x4   16x9  9x16
+ *     1K    ✅    ✅    ✅    ❌    ❌    (1K 宽屏被 OpenAI 拒:像素过小)
+ *     2K    ✅    ✅    ✅    ✅    ✅    (2K 全通)
+ *     4K    ❌    ❌    ❌    ✅    ✅    (4K 非宽屏被拒:像素预算超)
  *
- * n>1 时按 n × creditsPerImage 计费。
+ * 计费按总像素阶梯(像素越多生成成本越高):
+ *   ≤ 1.0 M px  → 1 credit
+ *   ≤ 2.5 M px  → 3 credits
+ *   ≤ 5.0 M px  → 8 credits
+ *   ≤ 9.0 M px  → 16 credits
+ *
+ * gpt-image-2 上游硬限制(实测,与套餐无关):
+ *   - 长边 ≤ 3840 px
+ *   - 总像素 ≲ 8.3 M (3072² 已超预算)
+ *   - background:"transparent" OpenAI 直接拒绝
  */
+
+export type Resolution = "1k" | "2k" | "4k";
+export type Aspect = "1x1" | "4x3" | "3x4" | "16x9" | "9x16";
+
+export const RESOLUTIONS: Resolution[] = ["1k", "2k", "4k"];
+export const ASPECTS: Aspect[] = ["1x1", "4x3", "3x4", "16x9", "9x16"];
+
+/** 长边像素 */
+const LONG_EDGE: Record<Resolution, number> = { "1k": 1024, "2k": 2048, "4k": 3840 };
+
+/** 比例 = (w, h) 单位向量,长边按 LONG_EDGE 缩放 */
+const RATIO: Record<Aspect, [number, number]> = {
+  "1x1": [1, 1],
+  "4x3": [4, 3],
+  "3x4": [3, 4],
+  "16x9": [16, 9],
+  "9x16": [9, 16],
+};
+
+/**
+ * 计算 (res, asp) → 真实像素尺寸 [w, h]。
+ * 长边对齐到 LONG_EDGE,短边按比例缩,向 8 取整(图像编码友好)。
+ */
+export function resolveDims(res: Resolution, asp: Aspect): [number, number] {
+  const long = LONG_EDGE[res];
+  const [rw, rh] = RATIO[asp];
+  const longSide = Math.max(rw, rh);
+  const shortSide = Math.min(rw, rh);
+  const shortPx = Math.round((long * shortSide) / longSide / 8) * 8;
+  return rw >= rh ? [long, shortPx] : [shortPx, long];
+}
+
+/** OpenAI 上游闸门:实测得到的 valid 集合 */
+const VALID_COMBOS = new Set<string>([
+  "1k-1x1", "1k-4x3", "1k-3x4",
+  "2k-1x1", "2k-4x3", "2k-3x4", "2k-16x9", "2k-9x16",
+  "4k-16x9", "4k-9x16",
+]);
+
+export function isValidCombo(res: Resolution, asp: Aspect): boolean {
+  return VALID_COMBOS.has(`${res}-${asp}`);
+}
+
+/** 像素阶梯定价 */
+function priceFromPixels(totalPx: number): number {
+  if (totalPx <= 1_000_000) return 1;
+  if (totalPx <= 2_500_000) return 3;
+  if (totalPx <= 5_000_000) return 8;
+  return 16;
+}
 
 export type ModelSpec = {
   name: string;
@@ -31,38 +85,43 @@ export type ModelSpec = {
   creditsPerImage: number;
 };
 
-export const MODEL_SPECS: Record<string, ModelSpec> = {
-  "img-standard": {
+/**
+ * 派生所有 valid 规格。1K 默认 medium,2K/4K 默认 high。
+ * 还额外暴露 1K-1x1 的 medium 版本 = "img-standard"(便宜的兼容档,Phase 1 已用)。
+ */
+export const MODEL_SPECS: Record<string, ModelSpec> = (() => {
+  const specs: Record<string, ModelSpec> = {};
+
+  // 兼容老命名:img-standard = 1K 1:1 medium 1cr,作为最便宜入口
+  specs["img-standard"] = {
     name: "img-standard",
-    description: "1024x1024,medium 画质。日常配图、缩略图。",
-    upstream: { model: "gpt-image-2", size: "1024x1024", quality: "medium", output_format: "png" },
+    description: "1024×1024,medium 画质。最便宜的入门档,适合缩略图、占位图。",
+    upstream: {
+      model: "gpt-image-2",
+      size: "1024x1024",
+      quality: "medium",
+      output_format: "png",
+    },
     creditsPerImage: 1,
-  },
-  "img-hd": {
-    name: "img-hd",
-    description: "1024x1024,high 画质。需要细节的方图。",
-    upstream: { model: "gpt-image-2", size: "1024x1024", quality: "high", output_format: "png" },
-    creditsPerImage: 3,
-  },
-  "img-2k-square": {
-    name: "img-2k-square",
-    description: "2048x2048,high 画质。大方图(海报、印刷预备)。",
-    upstream: { model: "gpt-image-2", size: "2048x2048", quality: "high", output_format: "png" },
-    creditsPerImage: 8,
-  },
-  "img-uhd-16x9": {
-    name: "img-uhd-16x9",
-    description: "3840x2160 真 4K UHD 横版,high 画质。视频封面、4K banner、屏保。",
-    upstream: { model: "gpt-image-2", size: "3840x2160", quality: "high", output_format: "png" },
-    creditsPerImage: 16,
-  },
-  "img-uhd-9x16": {
-    name: "img-uhd-9x16",
-    description: "2160x3840 真 4K UHD 竖版,high 画质。竖版海报、手机壁纸、小红书素材。",
-    upstream: { model: "gpt-image-2", size: "2160x3840", quality: "high", output_format: "png" },
-    creditsPerImage: 16,
-  },
-};
+  };
+
+  for (const res of RESOLUTIONS) {
+    for (const asp of ASPECTS) {
+      if (!isValidCombo(res, asp)) continue;
+      const [w, h] = resolveDims(res, asp);
+      const px = w * h;
+      const quality: "medium" | "high" = res === "1k" ? "high" : "high";
+      const name = `img-${res}-${asp}`;
+      specs[name] = {
+        name,
+        description: `${w}×${h} (${res.toUpperCase()} ${asp.replace("x", ":")}),${quality} 画质。`,
+        upstream: { model: "gpt-image-2", size: `${w}x${h}`, quality, output_format: "png" },
+        creditsPerImage: priceFromPixels(px),
+      };
+    }
+  }
+  return specs;
+})();
 
 export function getModelSpec(name: string): ModelSpec | null {
   return MODEL_SPECS[name] ?? null;
