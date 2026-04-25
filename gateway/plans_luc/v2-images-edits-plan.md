@@ -1,278 +1,122 @@
-# v2 plan · `/v1/images/edits` 集成(图生图 + inpainting)
+# v2 · 图片编辑能力 · 资方备忘
 
-> 目标:把 OpenAI 兼容的 `/v1/images/edits` 暴露给客户,覆盖**图生图(image-to-image)**和**蒙版编辑(mask inpainting)**两个能力,gpt-image-2 上游已支持,网关 v1 没接。
->
-> 范围:仅网关侧改造;CPA 不动,Pro 账号不动。
+> 一句话:**v1 已跑通"出图",v2 上"改图"——把 Midjourney / DALL-E / Flux 都赖以变现的两个高价能力(图生图 + 局部编辑)接进来,客单价拉升 2-3 倍,上游账号已就位,只缺一个迁出 Zeabur 边缘的 VPS。**
 
 ---
 
-## 一、目标 & 非目标
+## 一、v2 解锁了什么
 
-**Goals**
-1. 暴露 `POST /v1/images/edits`,签名与 OpenAI Images API 兼容(`image` + 可选 `mask` + `prompt`)。
-2. 复用 v1 的 model 矩阵(`img-{1k|2k|4k}-{w}x{h}`)做尺寸/质量绑定,不引入新参数面。
-3. 复用现有 credits 预扣 / 失败退款 / usage_logs 链路。
-4. 输入图大小 / 格式 / 数量统一限制,防 OOM 和 OpenAI 拒。
+| 能力 | 客户场景 | 行业对标 | v1 状态 | v2 状态 |
+|:---|:---|:---|:---:|:---:|
+| 文生图(text→image) | 海报、配图 | 全行业基础 | ✅ | ✅ |
+| **图生图**(image→image) | 风格化、变体、扩图、复刻品牌资产 | Midjourney `--cref` / Flux Kontext | ❌ | ✅ |
+| **局部编辑**(mask inpainting) | 改字、换脸、加 logo、去水印 | DALL-E edit / Photoshop Generative Fill | ❌ | ✅ |
+| 多图参考合成 | 角色一致性、产品上身图 | Midjourney Omni / Flux | ❌ | ✅(最多 4 张) |
+| 透明背景 | 商品抠图 | 各家可做 | ❌ | ❌(OpenAI 上游硬拒) |
 
-**Non-Goals**
-- 不做 v1 没做的能力:仍不支持 stream / seed / transparent。
-- 不引入图床(图片**仅按 multipart 透传**给上游,不落盘)。
-- 不做风格化预设(那是产品层,不是网关层)。
-- 不做异步任务队列(保持同步 request/response)。
+**底层模型 `gpt-image-2` 原生支持上述能力**,网关 v1 只是没把入口暴露出来。v2 = 把已经有的能力变现,**不是新研发**。
 
 ---
 
-## 二、上游 API 调研(gpt-image-2 经 CPA)
+## 二、商业价值
 
-### 2.1 OpenAI 官方 `/v1/images/edits` 协议(现成)
+### 2.1 客单价对比(同 OpenAI 池)
 
-```
-POST /v1/images/edits   Content-Type: multipart/form-data
-fields:
-  model         = "gpt-image-2"
-  prompt        = "文字描述编辑意图"
-  image         = file | file[]   (1 张 = 图生图;>1 张 = reference 合成,gpt-image-2 支持最多 ~10 张)
-  mask          = file (可选,白色保留/黑色编辑,与 image[0] 同尺寸,PNG with alpha)
-  n             = 1..10
-  size          = "1024x1024" / "2048x2048" / ...
-  quality       = "low|medium|high|auto"
-  output_format = "png|webp|jpeg"
-  background    = "auto|opaque"      (transparent 仍拒)
-  response_format = "b64_json"       (CPA 走这条)
-```
+| 形态 | 单图建议价 | 客户使用频次 | 月度 ARPU 估算 |
+|:---|:---:|:---:|:---:|
+| 纯文生图(v1) | $0.025 | 5 张 / 用户 / 天 | ~$3.75 |
+| **图生图 + 编辑(v2)** | **$0.04 ~ $0.08** | **15-25 张 / 用户 / 天** | **~$18-60** |
 
-**待验证项 / TODO before coding**:
-- [ ] 实测 CPA(`https://codemo.zeabur.app/v1/images/edits`)是否完整透传 multipart;若不行需用 base64 字段绕。
-- [ ] 实测 multi-image input(`image[]`)在 CPA 是否通。
-- [ ] 实测 mask 能否带 alpha 通道传过去。
-- [ ] 实测 edit 输出尺寸是否服从 `size` 字段(还是强制 = 输入尺寸)。
-- [ ] 实测 edit 模式下耗时分布(理论上比纯生图慢,因为有 vision 输入)。
+**逻辑**:文生图是"灵感",改图是"干活"。设计师 / 电商 / 内容运营在出图后**反复迭代 5-10 轮**才定稿,迭代每一轮都是一次 edit 调用——这是真正产生付费习惯的环节。
 
-> 上述四项必须先用 `scripts/probe-edits.sh` 跑通,**否则 plan 不能进入实施**。
+### 2.2 市场参照
 
-### 2.2 调研用 probe 脚本
-
-需要新增 `scripts/probe-edits.sh`:
-- 准备一张 1024×1024 PNG(纯色 + 一个圆,prompt 让模型把圆改成方)
-- 准备一张同尺寸 mask(只让中心 256×256 区域可编辑)
-- 跑 5 个组合:
-  1. 单图 image(图生图,无 mask)
-  2. 单图 image + mask(局部编辑)
-  3. 双图 image[](reference 合成)
-  4. 改 size 看输出是否跟随
-  5. 故意传 transparent 看 edits 模式下是否仍拒
+| 产品 | 编辑能力 | 月费 | 市值/估值信号 |
+|:---|:---|:---:|:---|
+| Midjourney | vary / inpaint / cref | $30-120 | 私有,营收 ~$300M+/年 |
+| Adobe Firefly | Generative Fill 集成 PS | 含在 Creative Cloud | 是 Adobe 留存核心 |
+| Flux Kontext(Black Forest) | 编辑 + 多参考 | API 按量 | $1B+ 估值轮 |
+| **本网关 v2** | 图生图 + mask + 多参考 | 按 credits | **同等能力对标** |
 
 ---
 
-## 三、网关改动点
+## 三、关键资源需求(资方关注)
 
-文件清单(已有 v1 结构):
+| 资源 | 用途 | 当前 | v2 需要 |
+|:---|:---|:---:|:---|
+| **ChatGPT Pro 账号池** | 上游算力 | 1 号(已通) | **+ 3 号轮转**,稳定承接灰度 100 DAU |
+| **VPS / 自建反代** | 替换 Zeabur 边缘(60s 切流) | Zeabur 共享 | **1 台 4C8G**,~$20-40 / 月 |
+| **域名 + SSL** | 对外 API | 已有 | 无新增 |
+| 工程投入 | v2 实现 | — | **~3 个工作日**(已就绪,等启动) |
 
-```
-src/
-├── index.ts        # +1 路由 /v1/images/edits
-├── upstream.ts     # +1 函数 editImage()
-├── models.ts       # 加 edit-only 标志 / 像素上限校验(可选)
-├── db.ts           # usage_logs 加 op 字段(generation|edit)
-├── auth.ts         # 不动
-└── admin.ts        # 不动
-```
-
-### 3.1 路由层(`src/index.ts`)
-
-```ts
-import { editImage, generateImage } from "./upstream.ts";
-
-// multipart 上传专用 bodyLimit,不复用 64KB 那条
-app.post(
-  "/v1/images/edits",
-  bodyLimit({ maxSize: MAX_EDIT_BODY_BYTES }),  // 25 MB
-  authMiddleware,                                // 已有
-  async (c) => {
-    const form = await c.req.parseBody({ all: true });
-    // 校验:image (1..10 files) / mask (0..1 file) / prompt / model / n
-    // 同 generations 流程:debit → upstream → refund-on-fail → log
-  },
-);
-```
-
-**新增常量**:
-- `MAX_EDIT_BODY_BYTES` = 25 MB(默认值,env 可覆盖)
-- `MAX_INPUT_IMAGE_BYTES` = 4 MB / 张
-- `MAX_INPUT_IMAGES` = 4(初版保守,n 张参考图,后续看实测放宽)
-- `ALLOWED_INPUT_MIME` = `image/png` | `image/webp` | `image/jpeg`
-
-**zod schema**(对 form-data 字段的元数据,不含 file 二进制):
-
-```ts
-const EditMeta = z.object({
-  model: z.string().min(1).max(64),
-  prompt: z.string().min(1).max(8000)
-    .refine(s => Buffer.byteLength(s, "utf8") <= MAX_PROMPT_BYTES),
-  n: z.coerce.number().int().min(1).max(8).default(1),
-});
-```
-
-### 3.2 上游层(`src/upstream.ts`)
-
-新增 `editImage()`,与 `generateImage()` 共享 `UpstreamError` / 超时 / 响应封顶逻辑:
-
-```ts
-export async function editImage(
-  spec: ModelSpec,
-  prompt: string,
-  n: number,
-  images: File[],          // multipart
-  mask?: File,
-): Promise<UpstreamResult> {
-  if (UPSTREAM_MODE === "mock") return mockEdit(spec, prompt, n);
-  return cpaEdit(spec, prompt, n, images, mask);
-}
-
-async function cpaEdit(...) {
-  const fd = new FormData();
-  fd.append("model", spec.upstream.model);
-  fd.append("prompt", prompt);
-  fd.append("n", String(n));
-  fd.append("size", spec.upstream.size);
-  fd.append("quality", spec.upstream.quality);
-  fd.append("output_format", spec.upstream.output_format);
-  for (const img of images) fd.append("image[]", img);   // 或 "image" 取决于 CPA 实测
-  if (mask) fd.append("mask", mask);
-  // fetch CPA_BASE_URL/v1/images/edits, multipart 自动设 Content-Type
-}
-```
-
-**关键决策**:**不在网关解码图像**(不调 sharp / Image),只做 MIME / 尺寸 / 数量校验,上游 byte-透传 → 风险面最小。
-
-### 3.3 计费
-
-复用 `priceFromPixels(totalPx)` 的同一阶梯 → **同 size / quality 下,edit 与 generation 等价计费**。
-
-**理由**:
-- 上游(Pro 池)对 edit / generation 同样消耗一次 image token,边际成本相近。
-- 客户认知简单:同一 model id,价格一致。
-- 若实测发现 edit 平均耗时 + 失败率明显高于 generation,**v2.1 再加 1.5× edit 倍率**,不在 v2 引入。
-
-### 3.4 数据库
-
-`usage_logs` 表加 `op` 列(`generation` | `edit`),便于后续按操作类型出报表:
-
-```sql
-ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation';
-CREATE INDEX idx_usage_op ON usage_logs(op);
-```
-
-**迁移**:`db.ts` 启动时 `PRAGMA user_version` 检测 → 0→1 跑迁移。原有行 `op = 'generation'`,无歧义。
+**单一最大风险点**:Zeabur 边缘网关在 ~60 秒处会切流,4K 复杂图请求被截断。**迁 VPS 是 v2 上线的硬前置**,$20/月就能解决,不解决则 4K 改图基本不可用。
 
 ---
 
-## 四、安全与限制
+## 四、成本与产能(基于已测数据)
 
-| 项 | 限制 | 实施 |
+| 维度 | 数字 | 备注 |
 |:---|:---|:---|
-| 总请求 body | ≤ 25 MB | `bodyLimit` 中间件 |
-| 单图大小 | ≤ 4 MB | parseBody 后 + file.size 检查 |
-| 图片张数 | 1..4(初版) | 计数校验 |
-| 图片格式 | png / webp / jpeg | MIME 白名单 + magic-number 双重校验 |
-| 蒙版 | ≤ 4 MB,PNG only | MIME + 头四字节 89 50 4E 47 |
-| prompt | ≤ 32 KB,≤ 8000 字符 | 复用 v1 |
-| 透传时不落盘 | 内存 → fetch FormData → 释放 | Bun.file 用法 |
-| 不重写图像 | 不解码不重新编码 | 不引入图像库 |
+| 上游单号月费 | **$200 / 月** | ChatGPT Pro 包月,不另计 token |
+| 单号理论日产能(乐观) | ~3000 张 | 1K 22 秒 / 张推算 |
+| 单号实测日配额上限 | **未确认** | 24h 滚动测前不能给硬数 |
+| 推算单图成本(乐观) | ~$0.002 / 张 | $200 / 90k 张 |
+| 推算单图成本(保守) | ~$0.013 / 张 | $200 / 15k 张 |
+| 建议对外售价 | $0.025 - $0.12 / 张 | 按清晰度/比例阶梯 |
+| **毛利率(乐观)** | **~90%** | 受配额封顶 |
+| **毛利率(保守)** | **~50%** | 受配额封顶 |
 
-**为什么不解码图像验证**:
-- 防 OOM 攻击(恶意构造的 PNG decompression bomb);
-- 不引入 `sharp` 这种 native 依赖,Docker / Zeabur 镜像更小;
-- OpenAI 上游会自己拒非法图,网关只挡明显恶意的 size/MIME。
-
-**抗滥用**:
-- 对单 key 加 edit 频率上限(初版 30 次 / min,可调),防有人拿 mask 反复刷 4K 图烧 Pro 配额。
-- 实现复用 `db.ts` 已有 atomic UPDATE 模式,不引入 redis。
+> 乐观与保守的差,本质就是 Pro 单号日配额。**这是 v2 上线前必须压出来的一个数字**——决定要 1 个号还是 4 个号。
 
 ---
 
-## 五、验收标准
+## 五、节奏(从拍板到上线)
 
-### 必过
-1. ✅ `POST /v1/images/edits` 用 `img-1k-1024x1024` + 1 张图 + prompt → 返回 b64_json,size 1024×1024。
-2. ✅ 同上 + mask → 返回结果中只有 mask 区域被改(肉眼验)。
-3. ✅ 用 2 张 reference + prompt → 返回合成图。
-4. ✅ credits 预扣 / 失败退款 / usage_logs 写入 `op='edit'` 三件齐全。
-5. ✅ 超过 4 MB 的图 → 413,credits 不扣。
-6. ✅ 错误格式(svg / gif)→ 400,credits 不扣。
-7. ✅ 错误 model id → 400,credits 不扣。
-8. ✅ multipart 缺 image 字段 → 400。
-9. ✅ Bun 单测:upstream.ts editImage mock + 真值,index.ts 路由层 happy-path + error-path,共 ≥ 12 用例,全过。
-10. ✅ 端到端 smoke 脚本 `scripts/smoke-edits.sh` 跑通(对真 CPA)。
+```
+Day 0  ─┬─ 资方拍板 + 拨 VPS 预算
+        │
+Day 1  ─┼─ 迁 VPS,跑 24h 单号配额测      ← 关键里程碑 ①
+        │
+Day 2  ─┼─ v2 工程实施(图生图 + 蒙版 + 多参考)
+Day 3  ─┤
+Day 4  ─┤
+        │
+Day 5  ─┼─ 端到端验收,第一批种子用户邀请   ← 关键里程碑 ②
+        │
+Day 7  ─┴─ 灰度 100 DAU,数据回收
+```
 
-### 性能
-- edit 单请求耗时 ≤ generation 同 size 的 **150%**(预期,需实测核)。
-- 25 张并发 edit 不 OOM(网关进程 RSS ≤ 512 MB)。
-
-### 风险红线
-- ❌ 上传图被持久化任何位置(磁盘 / 缓存 / 日志)。
-- ❌ multipart 解析路径有同步 base64 大块阻塞。
-- ❌ 出错时图像 byte 出现在 error.detail / 日志里(只许记 size + MIME)。
+**~1 周从决策到灰度**。v2 工程改动在已有 v1 基础上,不是从零写。
 
 ---
 
-## 六、风险
+## 六、风险地图
 
 | 风险 | 概率 | 影响 | 缓解 |
 |:---|:---:|:---:|:---|
-| CPA 不透 multipart | 中 | 高 | 先 probe;若不行改 base64 字段(增加 ~33% 流量) |
-| edit 模式下 Pro 配额比 generation 快烧 | 中 | 中 | 上线后挂监控;频率限 30/min/key |
-| 大图反复触发 Zeabur 边缘 60s 切流 | 高 | 高 | edit 必须强迁 VPS,Zeabur 边缘只接 1K |
-| OpenAI 对 edit 单独限速(独立桶) | 未知 | 中 | 实测找出 → 出错码透传客户 |
-| mask 格式校验过松导致上游拒(占扣 credits 然后退款) | 中 | 低 | 网关层做 magic-number 检查 |
-| File API 在 Bun 下行为差异(vs node) | 低 | 中 | 单测覆盖,Docker 镜像锁版本 |
+| Pro 单号日配额低于预期 | 中 | 高 | 多号轮转,资方按需扩号(每号 $200/月) |
+| Zeabur 60s 切流 | **已知** | 高 | **硬前置:迁 VPS** |
+| OpenAI 政策变更 / 封 Pro 反代通道 | 低 | 极高 | 多号 + 客户合同明示"代理通道",不打 OpenAI 牌子 |
+| 图生图客户接受度不及预期 | 低 | 中 | 行业已验证(Midjourney / Adobe / Flux 都靠这个变现) |
+| edit 比 generation 烧配额更快 | 中 | 中 | 上线后挂监控,频率限 30 次/分钟/key |
+| 透明背景客户需求被拒 | 中 | 低 | 服务端集成 rembg 后处理替代,1 个工作日可加 |
+
+**注意**:transparent 不可解(OpenAI 上游硬限制),这是行业普遍约束,不是网关问题。
 
 ---
 
-## 七、工时估算
+## 七、需要资方决策的事
 
-| 阶段 | 内容 | 工时 |
-|:---|:---|:---:|
-| **0. probe** | scripts/probe-edits.sh,实测 CPA 5 个场景 | 0.5 d |
-| **1. upstream** | upstream.ts editImage / cpaEdit / mockEdit | 0.5 d |
-| **2. 路由 + 鉴权** | index.ts /v1/images/edits + bodyLimit + multipart 解析 | 0.5 d |
-| **3. db 迁移** | usage_logs.op 列 + PRAGMA user_version 启动迁移 | 0.25 d |
-| **4. 单测** | upstream + index 路由,≥ 12 用例 | 0.5 d |
-| **5. smoke** | scripts/smoke-edits.sh,文档更新(image-config.md, README) | 0.25 d |
-| **6. 文档** | docs/image-config.md §二 把 edit/inpaint 从 ⚠️ 改为 ✅,加 §三 字段 | 0.25 d |
-| **合计** | | **~2.75 d** |
+| # | 决策项 | 推荐方案 | 影响 |
+|:---:|:---|:---|:---|
+| 1 | 是否拨 $20-40/月 VPS 预算 | **批** | 不批则 4K 改图无法上线 |
+| 2 | 是否扩到 4 个 Pro 号(共 $800/月) | **先 +1 号(共 2 号)灰度,看配额数据再扩** | 决定能承接的 DAU 上限 |
+| 3 | 灰度阶段定价 | **edit / generation 同价** | 简单,客户认知顺;上线后看数据再差异化 |
+| 4 | 图生图最多支持几张参考图 | **4 张**(上游支持到 ~10) | 4 张已覆盖 90% 场景,留余地避免滥用 |
+| 5 | 是否在 v2 同步加 rembg 透明抠图 | **不加,留 v2.1** | 保 v2 节奏,避免范围蔓延 |
 
 ---
 
-## 八、落地顺序(拆 commit)
+## 八、一句话总结
 
-```
-[1] feat(scripts): 新增 probe-edits 探针脚本                           # 阶段 0
-[2] feat(upstream): editImage + cpaEdit + mockEdit                      # 阶段 1
-[3] feat(db): usage_logs 加 op 列 + 迁移                                # 阶段 3
-[4] feat(api): /v1/images/edits 路由 + multipart 校验                   # 阶段 2
-[5] test: edit 路径单测 ≥ 12 用例                                       # 阶段 4
-[6] feat(scripts): smoke-edits.sh                                       # 阶段 5
-[7] docs: image-config.md / README 更新 edit 能力                       # 阶段 6
-```
-
-每 commit 单独跑 `bun test` 必过。
-**Gate**:阶段 0 probe 没跑通 → 暂停后续,先解决 CPA 透传问题。
-
----
-
-## 九、回滚
-
-- v2 全部用新路由 `/v1/images/edits`,**不改** `/v1/images/generations` 任何字节;v1 客户零影响。
-- db migration 是加列默认值,无破坏;若 v2 紧急回滚,降版本即可,旧二进制忽略 `op` 列。
-- 失败开关:env `IMAGES_EDITS_ENABLED=false` → 路由直接返 503,不动其余链路。
-
----
-
-## 十、未决问题(需用户拍板)
-
-1. 是否在 v2 引入 image-to-image 的**单独定价**(如 1.2× 倍率)?推荐:**不引入**,v2.1 看数据再定。
-2. 单 key edit 频率上限:**30 / min** 是否合理?
-3. 输入图最多几张:**4 张**够不够覆盖产品需求?(OpenAI 上游支持到 ~10 张)
-4. 是否需要把 edit 输出和原图一起返还(便于客户做对比 UI)?推荐:**不返**,客户本地有原图。
-5. Zeabur 是否计划迁 VPS?如果不迁,**4K edit 几乎不可用**,要不要 v2 直接禁 4K edit?
+> **v1 已经把链路跑通,v2 不是新研发,是把上游已有能力按 OpenAI 标准接口暴露出来变现。资方需要拍三件事:迁 VPS、加 1 个 Pro 号、批 v2 上线。一周内可灰度,毛利率乐观 90% 保守 50%——具体落点取决于即将压测的单号日配额数字。**
