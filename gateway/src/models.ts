@@ -4,12 +4,17 @@
  * 客户看到的是 OpenAI 风格的 model name;网关内部把它翻译成 CPA 的
  * (size, quality, output_format) 一组参数,顺便决定计费倍率。
  *
- * 单图成本(credits)按规格定:
- *   img-standard    1
- *   img-hd          3
- *   img-4k-square   8
- *   img-4k-16x9     8
- *   img-4k-9x16     8
+ * gpt-image-2 实测硬限制(2026-04-25 在 Pro 账号):
+ *   - 最长边 ≤ 3840 px
+ *   - 总像素 ≲ 8.3M(3072x3072 已超预算)
+ *   - background:"transparent" OpenAI 上游硬拒绝(任何套餐都不行)
+ *
+ * 单图成本(credits)按总像素阶梯定:
+ *   img-standard    1   (1M px,medium)
+ *   img-hd          3   (1M px,high)
+ *   img-2k-square   8   (4.2M px,high)  — 之前误名 img-4k-square
+ *   img-uhd-16x9   16   (8.3M px,真 4K UHD 横版)
+ *   img-uhd-9x16   16   (8.3M px,真 4K UHD 竖版)
  *
  * n>1 时按 n × creditsPerImage 计费。
  */
@@ -18,8 +23,8 @@ export type ModelSpec = {
   name: string;
   description: string;
   upstream: {
-    model: string; // 转给 CPA 的 model 字段
-    size: string; // 1024x1024 / 2048x2048 / 2048x1152 / 1152x2048
+    model: string;
+    size: string;
     quality: "low" | "medium" | "high";
     output_format: "png" | "webp";
   };
@@ -39,23 +44,23 @@ export const MODEL_SPECS: Record<string, ModelSpec> = {
     upstream: { model: "gpt-image-2", size: "1024x1024", quality: "high", output_format: "png" },
     creditsPerImage: 3,
   },
-  "img-4k-square": {
-    name: "img-4k-square",
-    description: "2048x2048,high 画质。海报、印刷预备。",
+  "img-2k-square": {
+    name: "img-2k-square",
+    description: "2048x2048,high 画质。大方图(海报、印刷预备)。",
     upstream: { model: "gpt-image-2", size: "2048x2048", quality: "high", output_format: "png" },
     creditsPerImage: 8,
   },
-  "img-4k-16x9": {
-    name: "img-4k-16x9",
-    description: "2048x1152,high 画质。横版 banner、视频封面。",
-    upstream: { model: "gpt-image-2", size: "2048x1152", quality: "high", output_format: "png" },
-    creditsPerImage: 8,
+  "img-uhd-16x9": {
+    name: "img-uhd-16x9",
+    description: "3840x2160 真 4K UHD 横版,high 画质。视频封面、4K banner、屏保。",
+    upstream: { model: "gpt-image-2", size: "3840x2160", quality: "high", output_format: "png" },
+    creditsPerImage: 16,
   },
-  "img-4k-9x16": {
-    name: "img-4k-9x16",
-    description: "1152x2048,high 画质。竖版海报、移动端、小红书素材。",
-    upstream: { model: "gpt-image-2", size: "1152x2048", quality: "high", output_format: "png" },
-    creditsPerImage: 8,
+  "img-uhd-9x16": {
+    name: "img-uhd-9x16",
+    description: "2160x3840 真 4K UHD 竖版,high 画质。竖版海报、手机壁纸、小红书素材。",
+    upstream: { model: "gpt-image-2", size: "2160x3840", quality: "high", output_format: "png" },
+    creditsPerImage: 16,
   },
 };
 

@@ -15,7 +15,7 @@ describe("models", () => {
   });
 
   test("calculateCost scales with n", () => {
-    const spec = MODEL_SPECS["img-4k-square"]!;
+    const spec = MODEL_SPECS["img-2k-square"]!;
     expect(calculateCost(spec, 1)).toBe(8);
     expect(calculateCost(spec, 4)).toBe(32);
   });
@@ -31,11 +31,11 @@ describe("models", () => {
     const list = listModels();
     expect(list).toHaveLength(5);
     expect(list.map((m) => m.id).sort()).toEqual([
-      "img-4k-16x9",
-      "img-4k-9x16",
-      "img-4k-square",
+      "img-2k-square",
       "img-hd",
       "img-standard",
+      "img-uhd-16x9",
+      "img-uhd-9x16",
     ]);
   });
 
