@@ -1,0 +1,10 @@
+node_modules
+.git
+.env
+data/*.db*
+*.log
+.DS_Store
+.playwright-mcp
+/tmp
+/dist
+README.md

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.zeabur.app/template.json",
+  "name": "image-gateway",
+  "description": "OpenAI-compatible image gateway. Wraps an upstream CPA (cliproxyapi) service and exposes 5 fixed model specs with credits-based billing.",
+  "buildCommand": "bun install --frozen-lockfile",
+  "startCommand": "bun run src/index.ts",
+  "ports": [
+    { "port": 8787, "type": "http" }
+  ],
+  "volumes": [
+    { "id": "data", "dir": "/app/data" }
+  ],
+  "env": {
+    "PORT": { "default": "8787", "expose": false },
+    "DB_PATH": { "default": "/app/data/gateway.db", "expose": false },
+    "KEY_HASH_SECRET": { "description": "REQUIRED. 32+ char pepper for hashing api keys. Generate via openssl rand -hex 32", "expose": false },
+    "ADMIN_TOKEN": { "description": "REQUIRED. 16+ char secret for /admin/* routes. Must NOT be 'change-me-please'.", "expose": false },
+    "UPSTREAM_MODE": { "default": "mock", "description": "mock | cpa", "expose": true },
+    "CPA_BASE_URL": { "default": "http://cliproxyapi.zeabur.internal:8080", "description": "Internal address of the cliproxyapi service in this project.", "expose": true },
+    "CPA_API_KEY": { "default": "", "description": "Optional bearer token for CPA's api-keys list.", "expose": true },
+    "UPSTREAM_TIMEOUT_MS": { "default": "120000", "expose": true },
+    "UPSTREAM_MAX_RESPONSE_BYTES": { "default": "52428800", "expose": true }
+  }
+}
