@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 : "${PORT:=8787}"
 : "${CPA_BASE_URL:=https://codemo.zeabur.app}"
 : "${CPA_API_KEY:?CPA_API_KEY env required}"
-: "${UPSTREAM_TIMEOUT_MS:=15000}"
+: "${UPSTREAM_TIMEOUT_MS:=180000}"
 
 rm -f data/gateway.db data/gateway.db-shm data/gateway.db-wal
 
@@ -49,19 +49,25 @@ echo "=== /v1/models ==="
 curl -s "http://127.0.0.1:$PORT/v1/models" -H "Authorization: Bearer $SK" | head -c 400; echo
 
 echo
-echo "=== generate (img-hd, cost=3, expect 504 timeout — CPA has 0 clients) ==="
+echo "=== generate (img-standard, real CPA, up to 3min) ==="
 T0=$(date +%s)
-RESP=$(curl -s -m 30 -o /tmp/gen.json -w "%{http_code}|%{time_total}" \
+RESP=$(curl -s -m 240 -o /tmp/gen.json -w "%{http_code}|%{time_total}" \
   -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
   -H "Authorization: Bearer $SK" -H "Content-Type: application/json" \
-  -d '{"model":"img-hd","prompt":"a cyberpunk cat"}')
+  -d '{"model":"img-standard","prompt":"a small orange tabby cat sitting on a sunlit windowsill, photo realistic"}')
 T1=$(date +%s)
 echo "  status|time_total: $RESP"
-echo "  body: $(cat /tmp/gen.json | head -c 300)"
+echo "  body_size_bytes: $(stat -c%s /tmp/gen.json 2>/dev/null || wc -c < /tmp/gen.json)"
+echo "  body_head: $(head -c 200 /tmp/gen.json)"
+# decode b64 to PNG if data present
+if grep -q b64_json /tmp/gen.json 2>/dev/null; then
+  python3 -c "import json,base64,sys; d=json.load(open('/tmp/gen.json'))['data'][0]['b64_json']; open('/tmp/gen.png','wb').write(base64.b64decode(d)); print(f'wrote /tmp/gen.png {len(base64.b64decode(d))} bytes')" 2>/dev/null || true
+  file /tmp/gen.png 2>/dev/null
+fi
 echo "  wall_elapsed: $((T1-T0))s"
 
 echo
-echo "=== balance (expect 200 — full refund after upstream timeout) ==="
+echo "=== balance (img-standard cost=1, expect 199 if success / 200 if failed) ==="
 BAL=$(curl -s "http://127.0.0.1:$PORT/v1/usage" -H "Authorization: Bearer $SK")
 echo "$BAL" | head -c 400; echo
 
