@@ -74,31 +74,41 @@ run_phase() {
   echo "==================================================================="
   echo "PHASE: $N concurrent  (model=$MODEL, timeout=${REQ_TIMEOUT}s/req)"
   echo "==================================================================="
-  local WALL_START
-  WALL_START=$(date +%s.%N)
+
+  # Barrier: pre-fork all N workers, each blocks on the gate file existing.
+  # Then we touch the gate at one instant -> all curl POSTs fire near-simultaneously
+  # (typical jitter <5ms vs naive "for i; do (...) &" which spreads over hundreds of ms).
+  local GATE="$DIR/gate"
+  rm -f "$GATE"
 
   for i in $(seq 1 "$N"); do
     (
-      local T0 T1 H BYTES DUR
+      while [[ ! -e "$GATE" ]]; do :; done
+      local T0 T1 H BYTES DUR ERRSAMPLE=""
       T0=$(date +%s.%N)
       H=$(curl -s -m "$REQ_TIMEOUT" -o "$DIR/r-$i.json" -w "%{http_code}" \
         -X POST "http://127.0.0.1:$PORT/v1/images/generations" \
         -H "Authorization: Bearer $SK" -H "Content-Type: application/json" \
-        -d "{\"model\":\"$MODEL\",\"prompt\":\"unique abstract pattern variant #$i, distinct composition, $(date +%N)\"}" \
+        -d "{\"model\":\"$MODEL\",\"prompt\":\"unique abstract pattern variant #$i, distinct composition\"}" \
         2>"$DIR/r-$i.err" || echo "000")
       T1=$(date +%s.%N)
       BYTES=$(wc -c <"$DIR/r-$i.json" 2>/dev/null || echo 0)
       DUR=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.3f", b-a}')
-      # error sample (first 160 chars) if not 200
-      local ERRSAMPLE=""
       if [[ "$H" != "200" ]]; then
         ERRSAMPLE=$(head -c 160 "$DIR/r-$i.json" 2>/dev/null | tr '\n' ' ')
         [[ -z "$ERRSAMPLE" ]] && ERRSAMPLE=$(head -c 160 "$DIR/r-$i.err" 2>/dev/null | tr '\n' ' ')
       fi
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$H" "$DUR" "$BYTES" "$T0" "$ERRSAMPLE" \
+      # 7 cols: id  http  dur  bytes  start_ts  end_ts  err
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$H" "$DUR" "$BYTES" "$T0" "$T1" "$ERRSAMPLE" \
         >>"$DIR/results.tsv"
     ) &
   done
+
+  sleep 0.5  # let all workers reach the spin
+  local WALL_START
+  WALL_START=$(date +%s.%N)
+  : >"$GATE"   # release: all N curls fire here
+
   wait
   local WALL_END WALL
   WALL_END=$(date +%s.%N)
@@ -126,6 +136,40 @@ run_phase() {
     else             printf "  [#%-3s] %-4s http=%-3s dur=%6.2fs err=%s\n",   $1, tag, code, dur, err
   }' "$DIR/results.tsv"
 
+  echo
+  echo "── concurrency signals"
+  # dispatch_span = max(start_ts) - min(start_ts);  小 → barrier 真把它们同时推出去了
+  # completion_span = max(end_ts) - min(end_ts);   小 → 上游真并行;接近 wall → 串行/排队
+  # max_in_flight = 时间窗扫描下,最高同时存活数 (event sweep over [start,end] intervals)
+  # first_fail_offset = 第一次出现非 200 的 (start - WALL_START)
+  awk -F'\t' -v ws="$WALL_START" '
+    {
+      start[NR]=$5; end[NR]=$6; code[NR]=$2
+      if (NR==1) { smin=$5; smax=$5; emin=$6; emax=$6 }
+      if ($5<smin) smin=$5; if ($5>smax) smax=$5
+      if ($6<emin) emin=$6; if ($6>emax) emax=$6
+      ev[++ec]=$5"\tup";  ev[++ec]=$6"\tdn"
+      if ($2!="200" && (ff_off=="" || $5<ff_t)) { ff_off=$5-ws; ff_t=$5; ff_code=$2 }
+    }
+    END {
+      printf "  dispatch_span    = %.3fs  (gap between first & last request leaving)\n", smax-smin
+      printf "  completion_span  = %.3fs  (gap between first & last request returning)\n", emax-emin
+      # sort events
+      n=ec
+      for (i=1;i<=n;i++) for (j=i+1;j<=n;j++) {
+        split(ev[i],a,"\t"); split(ev[j],b,"\t")
+        if (a[1]+0 > b[1]+0) { tmp=ev[i]; ev[i]=ev[j]; ev[j]=tmp }
+      }
+      cur=0; mx=0
+      for (i=1;i<=n;i++) {
+        split(ev[i],p,"\t")
+        if (p[2]=="up") cur++; else cur--
+        if (cur>mx) mx=cur
+      }
+      printf "  max_in_flight    = %d  (peak overlapping requests; ≈N → upstream parallel, ≈1 → serialized)\n", mx
+      if (ff_off!="") printf "  first_fail_at    = %.2fs after launch  (http=%s)\n", ff_off, ff_code
+      else            printf "  first_fail_at    = none\n"
+    }' "$DIR/results.tsv"
   echo
   echo "── summary"
   printf "  total=%d  ok=%d  fail=%d  (timeout=%d 5xx=%d 4xx=%d other=%d)\n" \
