@@ -26,7 +26,7 @@ const MAX_INPUT_IMAGE_BYTES = Number(process.env.MAX_INPUT_IMAGE_BYTES ?? 4 * 10
 const MAX_INPUT_IMAGES = Number(process.env.MAX_INPUT_IMAGES ?? 4);
 const MAX_PROMPT_BYTES = 32 * 1024;
 const ALLOWED_INPUT_MIME = new Set(["image/png", "image/webp", "image/jpeg"]);
-const IMAGES_EDITS_ENABLED = (process.env.IMAGES_EDITS_ENABLED ?? "true") !== "false";
+const imagesEditsEnabled = () => (process.env.IMAGES_EDITS_ENABLED ?? "true") !== "false";
 
 const app = new Hono();
 app.use("*", requestIdMiddleware);
@@ -252,6 +252,68 @@ export function readPngDims(buf: Uint8Array): { width: number; height: number } 
 }
 
 /** Sniff true MIME by magic bytes. Never trust client Content-Type. */
+
+
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < CRC_TABLE.length; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  CRC_TABLE[n] = c >>> 0;
+}
+
+function crc32(buf: Uint8Array, start: number, length: number): number {
+  let crc = 0xffffffff;
+  const end = start + length;
+  for (let i = start; i < end; i++) {
+    crc = CRC_TABLE[(crc ^ buf[i]!) & 0xff]! ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function isAsciiLetterByte(b: number): boolean {
+  return (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+export function isStructurallyValidPng(buf: Uint8Array): boolean {
+  if (!readPngDims(buf)) return false;
+  let offset = 8;
+  let seenIhdr = false;
+  let seenIdat = false;
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  while (offset + 12 <= buf.length) {
+    const length = dv.getUint32(offset, false);
+    const typeOffset = offset + 4;
+    const dataOffset = offset + 8;
+    const crcOffset = dataOffset + length;
+    const nextOffset = crcOffset + 4;
+    if (nextOffset > buf.length) return false;
+    const a = buf[typeOffset]!;
+    const b = buf[typeOffset + 1]!;
+    const c = buf[typeOffset + 2]!;
+    const d = buf[typeOffset + 3]!;
+    if (!isAsciiLetterByte(a) || !isAsciiLetterByte(b) || !isAsciiLetterByte(c) || !isAsciiLetterByte(d)) {
+      return false;
+    }
+    const expectedCrc = dv.getUint32(crcOffset, false);
+    if (crc32(buf, typeOffset, 4 + length) !== expectedCrc) return false;
+    const isIhdr = a === 0x49 && b === 0x48 && c === 0x44 && d === 0x52;
+    const isIdat = a === 0x49 && b === 0x44 && c === 0x41 && d === 0x54;
+    const isIend = a === 0x49 && b === 0x45 && c === 0x4e && d === 0x44;
+    if (!seenIhdr) {
+      if (!isIhdr || length !== 13) return false;
+      seenIhdr = true;
+    } else if (isIhdr) {
+      return false;
+    }
+    if (isIdat) seenIdat = true;
+    if (isIend) return seenIdat && length === 0 && nextOffset === buf.length;
+    offset = nextOffset;
+  }
+  return false;
+}
+
 export function sniffImageMime(buf: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | null {
   if (buf.length < 12) return null;
   // PNG
@@ -275,10 +337,13 @@ export function sniffImageMime(buf: Uint8Array): "image/png" | "image/jpeg" | "i
   return null;
 }
 
-/** Read at most n bytes from a File. Files are already capped at MAX_INPUT_IMAGE_BYTES. */
-async function readHead(file: File, n: number): Promise<Uint8Array> {
-  const buf = new Uint8Array(await file.arrayBuffer());
-  return buf.subarray(0, Math.min(n, buf.byteLength));
+export async function readFileHead(file: File, n: number): Promise<Uint8Array> {
+  const slice = (file as unknown as { slice(start?: number, end?: number): Blob }).slice(0, n);
+  return new Uint8Array(await slice.arrayBuffer());
+}
+
+async function readFileBytes(file: File): Promise<Uint8Array> {
+  return new Uint8Array(await file.arrayBuffer());
 }
 
 app.post(
@@ -288,7 +353,7 @@ app.post(
     const requestId = c.get("requestId");
     const t0 = performance.now();
 
-    if (!IMAGES_EDITS_ENABLED) {
+    if (!imagesEditsEnabled()) {
       return c.json(
         { error: { type: "service_unavailable", message: "edits endpoint disabled" } },
         503,
@@ -334,85 +399,6 @@ app.post(
         400,
       );
     }
-    const sniffedMimes: ("image/png" | "image/jpeg" | "image/webp")[] = [];
-    for (const img of images) {
-      if (img.size > MAX_INPUT_IMAGE_BYTES) {
-        return c.json(
-          { error: { type: "invalid_request", message: "input image too large" } },
-          413,
-        );
-      }
-      const head = await readHead(img, 24);
-      const sniffed = sniffImageMime(head);
-      if (!sniffed || !ALLOWED_INPUT_MIME.has(sniffed)) {
-        return c.json(
-          {
-            error: {
-              type: "invalid_request",
-              message: "unsupported image format (must be png/jpeg/webp by content)",
-            },
-          },
-          400,
-        );
-      }
-      sniffedMimes.push(sniffed);
-    }
-
-    // ---- mask (optional) ----
-    const rawMask = form["mask"];
-    const mask = rawMask instanceof File ? rawMask : undefined;
-    if (mask) {
-      if (mask.size > MAX_INPUT_IMAGE_BYTES) {
-        return c.json(
-          { error: { type: "invalid_request", message: "mask too large" } },
-          413,
-        );
-      }
-      const maskHead = await readHead(mask, 24);
-      if (sniffImageMime(maskHead) !== "image/png") {
-        return c.json(
-          { error: { type: "invalid_request", message: "mask must be PNG" } },
-          400,
-        );
-      }
-      const maskDims = readPngDims(maskHead);
-      if (!maskDims) {
-        return c.json(
-          { error: { type: "invalid_request", message: "mask is not a valid PNG" } },
-          400,
-        );
-      }
-      // When mask is given, image[0] MUST be a real PNG so we can compare dims.
-      if (sniffedMimes[0] !== "image/png") {
-        return c.json(
-          {
-            error: {
-              type: "invalid_request",
-              message: "image[0] must be PNG when mask is provided",
-            },
-          },
-          400,
-        );
-      }
-      const firstImage = images[0]!;
-      const imgHead = await readHead(firstImage, 24);
-      const imgDims = readPngDims(imgHead);
-      if (
-        imgDims &&
-        (imgDims.width !== maskDims.width || imgDims.height !== maskDims.height)
-      ) {
-        return c.json(
-          {
-            error: {
-              type: "invalid_request",
-              message: `mask size ${maskDims.width}x${maskDims.height} != image[0] size ${imgDims.width}x${imgDims.height}`,
-            },
-          },
-          400,
-        );
-      }
-    }
-
     // ---- prompt / model / n ----
     const promptRaw = form["prompt"];
     const promptStr = typeof promptRaw === "string" ? promptRaw : "";
@@ -450,6 +436,95 @@ app.post(
       );
     }
     const n = nParsed;
+
+    const sniffedMimes: ("image/png" | "image/jpeg" | "image/webp")[] = [];
+    let firstImageDims: { width: number; height: number } | null = null;
+    for (const [idx, img] of images.entries()) {
+      if (img.size > MAX_INPUT_IMAGE_BYTES) {
+        return c.json(
+          { error: { type: "invalid_request", message: "input image too large" } },
+          413,
+        );
+      }
+      const head = await readFileHead(img, 24);
+      const sniffed = sniffImageMime(head);
+      if (!sniffed || !ALLOWED_INPUT_MIME.has(sniffed)) {
+        return c.json(
+          {
+            error: {
+              type: "invalid_request",
+              message: "unsupported image format (must be png/jpeg/webp by content)",
+            },
+          },
+          400,
+        );
+      }
+      if (sniffed === "image/png") {
+        const bytes = await readFileBytes(img);
+        if (!isStructurallyValidPng(bytes)) {
+          return c.json(
+            { error: { type: "invalid_request", message: "invalid PNG image" } },
+            400,
+          );
+        }
+        if (idx === 0) firstImageDims = readPngDims(head);
+      }
+      sniffedMimes.push(sniffed);
+    }
+
+    // ---- mask (optional) ----
+    const rawMask = form["mask"];
+    const mask = rawMask instanceof File ? rawMask : undefined;
+    if (mask) {
+      if (mask.size > MAX_INPUT_IMAGE_BYTES) {
+        return c.json(
+          { error: { type: "invalid_request", message: "mask too large" } },
+          413,
+        );
+      }
+      const maskBytes = await readFileBytes(mask);
+      const maskHead = maskBytes.subarray(0, Math.min(24, maskBytes.byteLength));
+      if (sniffImageMime(maskHead) !== "image/png") {
+        return c.json(
+          { error: { type: "invalid_request", message: "mask must be PNG" } },
+          400,
+        );
+      }
+      const maskDims = readPngDims(maskHead);
+      if (!maskDims || !isStructurallyValidPng(maskBytes)) {
+        return c.json(
+          { error: { type: "invalid_request", message: "mask is not a valid PNG" } },
+          400,
+        );
+      }
+      // When mask is given, image[0] MUST be a real PNG so we can compare dims.
+      if (sniffedMimes[0] !== "image/png") {
+        return c.json(
+          {
+            error: {
+              type: "invalid_request",
+              message: "image[0] must be PNG when mask is provided",
+            },
+          },
+          400,
+        );
+      }
+      const imgDims = firstImageDims;
+      if (
+        imgDims &&
+        (imgDims.width !== maskDims.width || imgDims.height !== maskDims.height)
+      ) {
+        return c.json(
+          {
+            error: {
+              type: "invalid_request",
+              message: `mask size ${maskDims.width}x${maskDims.height} != image[0] size ${imgDims.width}x${imgDims.height}`,
+            },
+          },
+          400,
+        );
+      }
+    }
 
     const spec = getModelSpec(model);
     if (!spec) {

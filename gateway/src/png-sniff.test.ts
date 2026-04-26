@@ -6,11 +6,30 @@ import { beforeAll, describe, expect, test } from "bun:test";
 
 let readPngDims: (buf: Uint8Array) => { width: number; height: number } | null;
 let sniffImageMime: (buf: Uint8Array) => "image/png" | "image/jpeg" | "image/webp" | null;
+let isStructurallyValidPng: (buf: Uint8Array) => boolean;
 
 beforeAll(async () => {
   const mod = await import("../src/index.ts");
   readPngDims = mod.readPngDims;
   sniffImageMime = mod.sniffImageMime;
+  isStructurallyValidPng = mod.isStructurallyValidPng;
+});
+
+describe("isStructurallyValidPng", () => {
+  test("header-only PNG is not structurally valid", () => {
+    expect(isStructurallyValidPng(makePngHeader(1, 1))).toBe(false);
+  });
+
+  test("minimal IHDR+IDAT+IEND PNG is structurally valid", () => {
+    expect(isStructurallyValidPng(makeTinyPng(1, 1))).toBe(true);
+  });
+
+  test("oversized chunk length is rejected without reading past buffer", () => {
+    const png = makeTinyPng(1, 1);
+    const dv = new DataView(png.buffer);
+    dv.setUint32(33, 0xfffffff0, false);
+    expect(isStructurallyValidPng(png)).toBe(false);
+  });
 });
 
 function makePngHeader(width: number, height: number): Uint8Array {
@@ -21,6 +40,35 @@ function makePngHeader(width: number, height: number): Uint8Array {
   const dv = new DataView(buf.buffer);
   dv.setUint32(16, width, false);
   dv.setUint32(20, height, false);
+  return buf;
+}
+
+function testCrc32(buf: Uint8Array, start: number, length: number): number {
+  let crc = 0xffffffff;
+  for (let i = start; i < start + length; i++) {
+    crc ^= buf[i]!;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function makeTinyPng(width: number, height: number): Uint8Array {
+  const buf = new Uint8Array(58);
+  buf.set(makePngHeader(width, height), 0);
+  buf[24] = 8;
+  buf[25] = 6;
+  buf.set([0, 0, 0], 26);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(29, testCrc32(buf, 12, 17), false);
+  buf.set([0, 0, 0, 1], 33);
+  buf.set([0x49, 0x44, 0x41, 0x54], 37);
+  buf[41] = 0;
+  dv.setUint32(42, testCrc32(buf, 37, 5), false);
+  buf.set([0, 0, 0, 0], 46);
+  buf.set([0x49, 0x45, 0x4e, 0x44], 50);
+  dv.setUint32(54, testCrc32(buf, 50, 4), false);
   return buf;
 }
 
