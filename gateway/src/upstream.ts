@@ -24,11 +24,25 @@ export type UpstreamImage = {
   revised_prompt?: string;
 };
 
+export type UpstreamUsageDetails = {
+  text_tokens?: number;
+  image_tokens?: number;
+};
+
+export type UpstreamUsage = {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  input_tokens_details?: UpstreamUsageDetails;
+  output_tokens_details?: UpstreamUsageDetails;
+};
+
 export type UpstreamResult = {
   created: number;
   data: UpstreamImage[];
   upstream_quality?: string;
   upstream_size?: string;
+  usage?: UpstreamUsage;
 };
 
 /**
@@ -46,6 +60,17 @@ export async function generateImage(
   return cpaGenerate(spec, prompt, n);
 }
 
+export async function editImage(
+  spec: ModelSpec,
+  prompt: string,
+  n: number,
+  images: File[],
+  mask?: File,
+): Promise<UpstreamResult> {
+  if (UPSTREAM_MODE === "mock") return mockEdit(spec, prompt, n);
+  return cpaEdit(spec, prompt, n, images, mask);
+}
+
 // ---------- mock ----------
 const TINY_PNG_B64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
@@ -60,6 +85,35 @@ async function mockGenerate(spec: ModelSpec, prompt: string, n: number): Promise
     })),
     upstream_quality: spec.upstream.quality,
     upstream_size: spec.upstream.size,
+    usage: mockUsage(0, n),
+  };
+}
+
+async function mockEdit(spec: ModelSpec, prompt: string, n: number): Promise<UpstreamResult> {
+  await new Promise((r) => setTimeout(r, 100 + Math.floor(Math.random() * 300)));
+  return {
+    created: Math.floor(Date.now() / 1000),
+    data: Array.from({ length: n }, () => ({
+      b64_json: TINY_PNG_B64,
+      revised_prompt: `[mock-edit] ${prompt.slice(0, 80)}`,
+    })),
+    upstream_quality: spec.upstream.quality,
+    upstream_size: spec.upstream.size,
+    usage: mockUsage(1, n),
+  };
+}
+
+function mockUsage(inputImages: number, n: number): UpstreamUsage {
+  const text_tokens = 50;
+  const image_tokens_in = inputImages * 1024;
+  const input_tokens = text_tokens + image_tokens_in;
+  const image_tokens_out = 196 * n;
+  return {
+    input_tokens,
+    output_tokens: image_tokens_out,
+    total_tokens: input_tokens + image_tokens_out,
+    input_tokens_details: { text_tokens, image_tokens: image_tokens_in },
+    output_tokens_details: { text_tokens: 0, image_tokens: image_tokens_out },
   };
 }
 
@@ -104,7 +158,13 @@ async function cpaGenerate(spec: ModelSpec, prompt: string, n: number): Promise<
       );
     }
 
-    let json: { created?: number; data?: UpstreamImage[]; quality?: string; size?: string };
+    let json: {
+      created?: number;
+      data?: UpstreamImage[];
+      quality?: string;
+      size?: string;
+      usage?: UpstreamUsage;
+    };
     try {
       json = JSON.parse(bodyText);
     } catch {
@@ -119,6 +179,93 @@ async function cpaGenerate(spec: ModelSpec, prompt: string, n: number): Promise<
       data: json.data,
       upstream_quality: json.quality,
       upstream_size: json.size,
+      usage: json.usage,
+    };
+  } catch (err) {
+    if (err instanceof UpstreamError) throw err;
+    if ((err as Error).name === "AbortError") {
+      throw new UpstreamError("upstream timeout", 504, true);
+    }
+    throw new UpstreamError(
+      "upstream fetch failed",
+      502,
+      true,
+      truncate((err as Error).message ?? "", 200),
+    );
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function cpaEdit(
+  spec: ModelSpec,
+  prompt: string,
+  n: number,
+  images: File[],
+  mask?: File,
+): Promise<UpstreamResult> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+
+  try {
+    const fd = new FormData();
+    fd.append("model", spec.upstream.model);
+    fd.append("prompt", prompt);
+    fd.append("n", String(n));
+    fd.append("size", spec.upstream.size);
+    fd.append("quality", spec.upstream.quality);
+    fd.append("output_format", spec.upstream.output_format);
+    for (const img of images) fd.append("image[]", img, img.name || "image.png");
+    if (mask) fd.append("mask", mask, mask.name || "mask.png");
+
+    const res = await fetch(`${CPA_BASE_URL}/v1/images/edits`, {
+      method: "POST",
+      headers: {
+        ...(CPA_API_KEY ? { Authorization: `Bearer ${CPA_API_KEY}` } : {}),
+      },
+      body: fd,
+      signal: ctrl.signal,
+    });
+
+    const declaredLength = Number(res.headers.get("content-length") ?? 0);
+    if (declaredLength > MAX_RESPONSE_BYTES) {
+      throw new UpstreamError("upstream response too large", 502, false);
+    }
+
+    const bodyText = await readCappedText(res, MAX_RESPONSE_BYTES);
+
+    if (!res.ok) {
+      const retriable = res.status === 429 || res.status >= 500;
+      throw new UpstreamError(
+        `upstream rejected request (status ${res.status})`,
+        res.status,
+        retriable,
+        truncate(bodyText, 500),
+      );
+    }
+
+    let json: {
+      created?: number;
+      data?: UpstreamImage[];
+      quality?: string;
+      size?: string;
+      usage?: UpstreamUsage;
+    };
+    try {
+      json = JSON.parse(bodyText);
+    } catch {
+      throw new UpstreamError("upstream returned non-JSON body", 502, true);
+    }
+
+    if (!json.data || !Array.isArray(json.data) || json.data.length === 0) {
+      throw new UpstreamError("upstream returned empty data", 502, true);
+    }
+    return {
+      created: json.created ?? Math.floor(Date.now() / 1000),
+      data: json.data,
+      upstream_quality: json.quality,
+      upstream_size: json.size,
+      usage: json.usage,
     };
   } catch (err) {
     if (err instanceof UpstreamError) throw err;
