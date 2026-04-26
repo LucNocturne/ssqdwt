@@ -6,34 +6,66 @@
 
 ---
 
+## 实证结果(2026-04-26 跑通)
+
+> 在写一行代码前先 5 个 curl 探针,**功能已确认可实现**。复现脚本:`gateway/scripts/probe-edits.sh`
+
+| # | 场景 | HTTP | 耗时 | 结论 |
+|:---:|:---|:---:|:---:|:---|
+| 1 | 单图 + `image` 字段 + `model=gpt-image-1` | 200 | 19 s | i2i 通 |
+| 2 | 单图 + `model=gpt-image-2` 别名 | 200 | 17 s | gpt-image-2 是 CPA 端有效别名 |
+| 3 | image + mask(同尺寸 PNG alpha) | 200 | 19 s | inpainting 通 |
+| 4 | `image[]` × 2 张 multi-ref | 200 | 21 s | 多参考通 |
+| 5 | usage 字段完整回传 | ✅ | — | 结构如下 |
+
+**实测 usage 字段结构**(单图 i2i):
+
+```json
+{
+  "input_tokens": 1074,
+  "input_tokens_details": { "image_tokens": 1024, "text_tokens": 50 },
+  "output_tokens": 196,
+  "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+  "total_tokens": 1270
+}
+```
+
+**关键发现**:
+- 输入图固定 **1024 image_tokens / 张**(2 张 → 2048,线性叠加)— 给资方做对账的硬数字
+- 输出图 ~196 tokens(1024×1024,medium 档;2K/4K 待补测)
+- **CPA 直接透传 multipart**,不需要直连 OpenAI Images API、不需要付费 API key
+- 两个 model 名 `gpt-image-1` / `gpt-image-2` 都通,CPA 内部应有别名映射
+
+**直接清掉的疑虑**:
+- ❌ "CPA 不透传 multipart" → 实证否定
+- ❌ "image vs image[] 字段名歧义" → 两种都通
+- ❌ "mask + multi-ref 是未定义行为" → 各自单独通(组合未测,本期不需要)
+- ❌ "双轨开发 / 自建直连" → 不需要,单链路 CPA 就行
+
+---
+
 ## 关键修订要点(2026-04-26)
 
-> 经多视角对赌后对原 plan 的两处必改。**范围不变**:i2i + mask + multi-ref 三件套一次性上,vibe coding 一小时级别工作量,无需分 v2 / v2.1。
+> 经多视角对赌 + curl 实证后对原 plan 的两处必改。**范围不变**:i2i + mask + multi-ref 三件套一次性上,vibe coding 一小时级别工作量,无需分 v2 / v2.1。
 
-### ① 链路风险前置 — probe + 直连 hot path 双轨开发
+### ① 链路确认 — CPA 单链路(已实证,无需双轨)
 
-不再"先 probe、不通再绕"乐观路径。**根据**:
-- `cpaGenerate` 实测用 `application/json` body(见 `src/upstream.ts:78-86`),CPA 主动控 `response_format=b64_json`;**这两点都证明 CPA 不是纯透明代理,而是对 body 做主动封装**。
-- `/v1/images/edits` 是 multipart 端点,与 CPA 现有 JSON 协议层不对称,大概率 CPA **不透传 multipart**。
-
-**应对**:`scripts/probe-edits.sh` 与 `src/upstream.ts:openaiEdit()` 同步开发(各 ~10-20 min):
-- probe 通 → 走 CPA 路径(零额外依赖)
-- probe 不通 → 立刻切 `openaiEdit()` 直连 `https://api.openai.com/v1/images/edits` + 独立 `OPENAI_API_KEY`
-
-**新增未决问题(Q2 → §十)**:Pro 账号 OAuth token 是绑定 ChatGPT session 的,**不能直接当 OpenAI API key 用**,直连必须独立付费 API key,这撕开了 Pro 包月的成本结构 → 见 ②。
+实证(见上节)直接打掉了"CPA 可能不透 multipart"的担心。`upstream.ts` 加一个 `cpaEdit()`(对照 `cpaGenerate()`,只是把 JSON body 换成 FormData)即可,不需要 `openaiEdit()` 直连分支、不需要独立 `OPENAI_API_KEY`、不需要资方批付费账号。
 
 ### ② 计费 day-1 引入 multiplier(供应核算系数,**非客户定价锚**)
 
-**背景修正**:网关 = 给资方做后端供应,credit 池对资方无限。multiplier 的作用**不是面向终端客户的价格信号**,而是**网关-资方之间的供应成本核算系数**:edit 比 generation 实际烧上游配额更重(多吃 vision encoder),应当在资方账目里反映为更高的供应单价。**实施成本 = 一行常量**,不影响范围。
+**背景修正**:网关 = 给资方做后端供应,credit 池对资方无限。multiplier 的作用**不是面向终端客户的价格信号**,而是**网关-资方之间的供应成本核算系数**:edit 比 generation 实际烧上游配额更重,应当在资方账目里反映。**实施成本 = 一行常量**。
 
-**倍率取决于 ① 的链路结果**:
+**实证锚点**:
+- generation 1024×1024 medium 输出 ~196 tokens(已知)
+- edit 1024×1024 medium 输入 ~1074 + 输出 ~196 = **总 ~1270 tokens**
+- **edit / generation 总 token 比 ≈ 1270 / ~200 ≈ 6.5×**(若上游真按 token 计费;Pro 包月下烧的是配额时间,差异更小)
 
-| 链路 | 上游真实成本 | 供应核算 multiplier | 备注 |
-|:---|:---|:---:|:---|
-| CPA + Pro 包月($200/月封顶) | edit 烧 Pro 配额 ≈ generation × 1.5 | **1.5×** | Pro 配额内边际成本接近零;1.5× 反映"配额烧速差"信号,供资方-供应方核算用 |
-| 直连 OpenAI Images API + 付费 key | edit 真实 USD/token,~$0.04/张 | **5-10×** | Pro 包月成本失效,必须按真实 token 价覆盖,这是资方供应费的真正下限 |
+**day-1 multiplier**:**1.5×**(保守反映"配额烧速差",6.5× 是 token 真账,1.5× 是 Pro 配额视角下的安全系数;链路确认走 CPA/Pro 路径,无 USD/token 真账压力)。
 
-**单 multiplier 常量,链路裁决后即填**。资方对其下游的对外定价不受此约束。
+---
+
+
 
 ---
 
@@ -188,46 +220,48 @@ async function cpaEdit(...) {
 
 ### 3.4 数据库
 
-`usage_logs` 表加 `op` 列(`generation` | `edit`)+ token 列(给资方下游对账用):
+`usage_logs` 表加 `op` 列(`generation` | `edit`)+ token 索引列 + usage 完整 JSON 列:
 
 ```sql
 ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation';
 ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE usage_logs ADD COLUMN image_tokens INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE usage_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_logs ADD COLUMN usage_json TEXT;  -- 完整保留嵌套结构
 CREATE INDEX idx_usage_op ON usage_logs(op);
 ```
 
-`db.ts` 启动时 `PRAGMA user_version` 检测 → 0→1 跑迁移。原有行 `op = 'generation'`,token 列默认 0。
+`db.ts` 启动时 `PRAGMA user_version` 检测 → 0→1 跑迁移。原有行 `op = 'generation'`,token 列默认 0,`usage_json` 为 NULL。
 
-### 3.5 Token usage 透传(v1 + v2 同步补)
+### 3.5 Token usage 透传(v1 + v2 同步补,实测结构)
 
-**上游响应字段**(gpt-image-2 实际返回结构):
+**实测上游响应**(单图 i2i / 1024×1024 / medium):
 
 ```json
 {
   "data": [{ "b64_json": "..." }],
+  "background": "auto",
+  "output_format": "png",
+  "quality": "medium",
+  "size": "1024x1024",
   "usage": {
-    "input_tokens": 12,
-    "output_tokens": 4160,
-    "input_tokens_details": {
-      "text_tokens": 12,
-      "image_tokens": 0
-    },
-    "total_tokens": 4172
+    "input_tokens": 1074,
+    "input_tokens_details": { "image_tokens": 1024, "text_tokens": 50 },
+    "output_tokens": 196,
+    "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+    "total_tokens": 1270
   }
 }
 ```
 
 **改动点**:
 
-1. `src/upstream.ts` · `UpstreamResult` 增字段 `usage?: { input_tokens, output_tokens, image_tokens, total_tokens }`
-2. `cpaGenerate` / `cpaEdit` / `openaiEdit` 解析上游 JSON 后填 `usage`(若上游缺 `usage`,字段全 0,不阻断)
-3. `src/index.ts` 路由层把 `usage` 原样写进网关响应 body(OpenAI 兼容,资方 SDK 直接读)
-4. `src/db.ts` 写 `usage_logs` 时把 token 字段一并落库(供后续对账查询)
+1. `src/upstream.ts` · `UpstreamResult` 增字段 `usage?: object`(类型 = 上面 JSON 结构原样)
+2. `cpaGenerate` / `cpaEdit` 解析上游 JSON 后填 `usage`(若上游缺 `usage`,字段为 `undefined`,不阻断)
+3. `src/index.ts` 路由层把 `usage` **原样**写进网关响应 body(嵌套结构保留,资方 SDK 直接读)
+4. `src/db.ts` 落 `usage_logs`:**整个 usage 序列化为 `usage_json TEXT` 列**(避免扁平化丢嵌套);同时单独抽出常用字段 `input_tokens` / `output_tokens` / `total_tokens` 做整数索引列,便于聚合查询
 
-**验收**:smoke 跑一次 generation,响应里能拿到 `usage.input_tokens` 等字段;`SELECT input_tokens FROM usage_logs ORDER BY id DESC LIMIT 1` 非零。
+**验收**:smoke 跑一次 generation,响应里能拿到 `usage.input_tokens_details.image_tokens` 等嵌套字段;`SELECT json_extract(usage_json, '$.input_tokens_details.image_tokens') FROM usage_logs ORDER BY id DESC LIMIT 1` 非零。
 
 ---
 
@@ -333,15 +367,12 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
 
 ## 十、未决问题(需用户拍板)
 
-> 硬决策项:
+> 经 probe 实证后剩余的硬决策项:
 
-1. **(Q1)CPA 是否透传 multipart?** — probe day-0 必跑,影响整条链路。
-2. **(Q2)若 CPA 不透传,直连 OpenAI Images API 用什么认证?**
-   - Pro OAuth token 不能直接当 API key([L3] 推断,待实测核)
-   - → **大概率必须独立付费 OPENAI_API_KEY**,Pro 包月成本结构失效,改按真实 token 计费
-   - **资方需准备 OpenAI 付费账号 + 预算上限**
-3. **(Q3)edit 烧 Pro 配额是否真比 generation 重?** — 决定 CPA 路径下 multiplier 数字(1.2× / 1.5× / 2×)
-4. ~~是否在 v2 引入 image-to-image 单独定价?~~ **已裁决:day-1 引入 multiplier 常量**(见「关键修订要点 ②」)
-5. 输入图最多几张:**4 张**(OpenAI 上游支持到 ~10 张)
+1. ~~**(Q1)CPA 是否透传 multipart?**~~ — **✅ 已实证通过**(见顶部「实证结果」)
+2. ~~**(Q2)直连 OpenAI Images API 用什么认证?**~~ — **作废**,不需要直连
+3. **(Q3)edit 烧 Pro 配额是否真比 generation 重?** — token 比 ≈ 6.5×,但 Pro 包月配额视角下差异更小;day-1 取 1.5× 保守安全。**待 24h 滚动配额测后看是否调到 2×**
+4. ~~是否在 v2 引入 image-to-image 单独定价?~~ **已裁决:day-1 multiplier=1.5×**
+5. 输入图最多几张:**4 张**(OpenAI 上游支持到 ~10 张;实测 2 张已通)
 6. 是否需要把 edit 输出和原图一起返还? 推荐:**不返**,客户本地有原图。
 7. **Zeabur 是否计划迁 VPS?** 如果不迁,**4K edit 几乎不可用**,可考虑 v2 直接禁 4K edit(只暴露 1K/2K)。
