@@ -89,8 +89,9 @@
 | 批量生成 `n` | ✅ | n=1..8(单号串行) |
 | credits 预扣 / 退款 | ✅ | atomic UPDATE,WAL 模式无竞态;recharge_logs 写 `reason='refund:<reqId>'` |
 | OpenAI 兼容签名 | ✅ | `POST /v1/images/generations`,字段对齐 |
-| 图生图 | — | 上游支持,v2 暴露 |
-| 蒙版编辑 | — | 上游支持,v2 暴露 |
+| 图生图 | ✅ | `POST /v1/images/edits`(v2 已上线,multipart) |
+| 蒙版编辑 | ✅ | mask PNG 同尺寸校验,网关层守门 |
+| 多参考图 | ✅ | `image[]` 最多 4 张 |
 | 透明背景 | ❌ | OpenAI 上游硬拒(invalid_value @ 2 s) |
 
 ---

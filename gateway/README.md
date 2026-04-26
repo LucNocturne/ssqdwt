@@ -95,9 +95,52 @@ curl -X POST http://127.0.0.1:8787/v1/images/generations \
     {"b64_json": "iVBORw0...", "revised_prompt": "..."},
     {"b64_json": "iVBORw0...", "revised_prompt": "..."}
   ],
-  "usage": {"credits": 6, "n": 2}
+  "usage": {
+    "credits": 6,
+    "n": 2,
+    "input_tokens": 12,
+    "output_tokens": 392,
+    "total_tokens": 404,
+    "input_tokens_details": { "text_tokens": 12, "image_tokens": 0 },
+    "output_tokens_details": { "text_tokens": 0, "image_tokens": 392 }
+  }
 }
 ```
+
+### 图生图 / 蒙版编辑(v2,multipart)
+
+```bash
+# 图生图(单图)
+curl -X POST http://127.0.0.1:8787/v1/images/edits \
+  -H "Authorization: Bearer sk-img-xxxxx" \
+  -F "model=img-standard" \
+  -F "prompt=replace red circle with blue square" \
+  -F "image=@in.png" \
+  -F "n=1"
+
+# inpainting(image + 同尺寸 PNG mask,白色保留 / alpha 透明 = 编辑区)
+curl -X POST http://127.0.0.1:8787/v1/images/edits \
+  -H "Authorization: Bearer sk-img-xxxxx" \
+  -F "model=img-standard" \
+  -F "prompt=put a yellow star in the masked area" \
+  -F "image=@in.png" -F "mask=@mask.png"
+
+# 多参考图(image[] 最多 4 张)
+curl -X POST http://127.0.0.1:8787/v1/images/edits \
+  -H "Authorization: Bearer sk-img-xxxxx" \
+  -F "model=img-standard" \
+  -F "prompt=combine the two images" \
+  -F "image[]=@a.png" -F "image[]=@b.png"
+```
+
+约束:
+- 总 body ≤ 25 MB,单图 ≤ 4 MB,1..4 张
+- image / mask:`image/png` · `image/webp` · `image/jpeg`(mask 必须 png)
+- mask 必须与 image[0] 同尺寸(网关层 PNG header 校验,不解码)
+- 不支持 stream、seed、transparent
+- 计费 = `creditsPerImage × tokenMultiplier × 1.5(EDIT_MULTIPLIER)× n`,向上取整
+
+env 开关:`IMAGES_EDITS_ENABLED=false` → 路由直接返 503,v1 generations 不受影响。
 
 ### 查余额 / 用量
 
