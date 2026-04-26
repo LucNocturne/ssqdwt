@@ -80,6 +80,7 @@ run_phase() {
   # (typical jitter <5ms vs naive "for i; do (...) &" which spreads over hundreds of ms).
   local GATE="$DIR/gate"
   rm -f "$GATE"
+  local PIDS=()
 
   for i in $(seq 1 "$N"); do
     (
@@ -102,6 +103,7 @@ run_phase() {
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$H" "$DUR" "$BYTES" "$T0" "$T1" "$ERRSAMPLE" \
         >>"$DIR/results.tsv"
     ) &
+    PIDS+=($!)
   done
 
   sleep 0.5  # let all workers reach the spin
@@ -109,7 +111,9 @@ run_phase() {
   WALL_START=$(date +%s.%N)
   : >"$GATE"   # release: all N curls fire here
 
-  wait
+  # wait ONLY on worker PIDs — bare `wait` would also wait on the gateway bun process
+  # which never exits.
+  wait "${PIDS[@]}"
   local WALL_END WALL
   WALL_END=$(date +%s.%N)
   WALL=$(awk -v a="$WALL_START" -v b="$WALL_END" 'BEGIN{printf "%.2f", b-a}')
