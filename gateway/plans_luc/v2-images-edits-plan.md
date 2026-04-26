@@ -22,18 +22,18 @@
 
 **新增未决问题(Q2 → §十)**:Pro 账号 OAuth token 是绑定 ChatGPT session 的,**不能直接当 OpenAI API key 用**,直连必须独立付费 API key,这撕开了 Pro 包月的成本结构 → 见 ②。
 
-### ② 计费 day-1 引入 multiplier,但**数字 conditional**
+### ② 计费 day-1 引入 multiplier(供应核算系数,**非客户定价锚**)
 
-抛弃 plan §3.3 原推荐"v2 1×、v2.1 调"。**理由**:1× 锚定后向上调价是涨价(高摩擦);差异化锚从一开始设,后续微调成本远低。**实施成本 = 一行常量**,不影响范围。
+**背景修正**:网关 = 给资方做后端供应,credit 池对资方无限。multiplier 的作用**不是面向终端客户的价格信号**,而是**网关-资方之间的供应成本核算系数**:edit 比 generation 实际烧上游配额更重(多吃 vision encoder),应当在资方账目里反映为更高的供应单价。**实施成本 = 一行常量**,不影响范围。
 
 **倍率取决于 ① 的链路结果**:
 
-| 链路 | 上游成本基础 | day-1 multiplier | 备注 |
+| 链路 | 上游真实成本 | 供应核算 multiplier | 备注 |
 |:---|:---|:---:|:---|
-| CPA + Pro 包月($200/月封顶) | edit 烧 Pro 配额 ≈ generation × 1.5(多 vision encoder) | **1.5×** | 配额未触限前,边际成本接近零;1.5× 反映"配额烧速差"信号 |
-| 直连 OpenAI Images API + 付费 key | edit 真实 USD/token,~$0.04/张 | **5-10×** | Pro 包月成本结构失效,必须按真实 token 价覆盖 |
+| CPA + Pro 包月($200/月封顶) | edit 烧 Pro 配额 ≈ generation × 1.5 | **1.5×** | Pro 配额内边际成本接近零;1.5× 反映"配额烧速差"信号,供资方-供应方核算用 |
+| 直连 OpenAI Images API + 付费 key | edit 真实 USD/token,~$0.04/张 | **5-10×** | Pro 包月成本失效,必须按真实 token 价覆盖,这是资方供应费的真正下限 |
 
-**单 multiplier 常量,链路裁决后即填**。文档同步在 v2 上线说明"edit 计费 = generation × N"。
+**单 multiplier 常量,链路裁决后即填**。资方对其下游的对外定价不受此约束。
 
 ---
 
@@ -45,6 +45,7 @@
 3. 复用现有 credits 预扣 / 失败退款 / usage_logs 链路,**day-1 引入 edit multiplier 常量**(数字见「关键修订要点 ②」)。
 4. 输入图大小 / 格式 / 数量统一限制,防 OOM 和 OpenAI 拒。
 5. **probe + 自建 hot path 直连 双轨开发**(见「关键修订要点 ①」),消除 CPA multipart 透传不确定性。
+6. **Token usage 透传** — v1 + v2 同步补:从上游响应解析 `usage`(`input_tokens` / `output_tokens` / `input_tokens_details.{text_tokens, image_tokens}` / `total_tokens`),原样在网关响应回传给资方,落库 `usage_logs` 便于资方对其下游做用量分摊与对账。
 
 **Non-Goals**
 - 不做 v1 没做的能力:仍不支持 stream / seed / transparent。
@@ -187,14 +188,46 @@ async function cpaEdit(...) {
 
 ### 3.4 数据库
 
-`usage_logs` 表加 `op` 列(`generation` | `edit`):
+`usage_logs` 表加 `op` 列(`generation` | `edit`)+ token 列(给资方下游对账用):
 
 ```sql
 ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation';
+ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_logs ADD COLUMN image_tokens INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE usage_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX idx_usage_op ON usage_logs(op);
 ```
 
-`db.ts` 启动时 `PRAGMA user_version` 检测 → 0→1 跑迁移。原有行 `op = 'generation'`。
+`db.ts` 启动时 `PRAGMA user_version` 检测 → 0→1 跑迁移。原有行 `op = 'generation'`,token 列默认 0。
+
+### 3.5 Token usage 透传(v1 + v2 同步补)
+
+**上游响应字段**(gpt-image-2 实际返回结构):
+
+```json
+{
+  "data": [{ "b64_json": "..." }],
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 4160,
+    "input_tokens_details": {
+      "text_tokens": 12,
+      "image_tokens": 0
+    },
+    "total_tokens": 4172
+  }
+}
+```
+
+**改动点**:
+
+1. `src/upstream.ts` · `UpstreamResult` 增字段 `usage?: { input_tokens, output_tokens, image_tokens, total_tokens }`
+2. `cpaGenerate` / `cpaEdit` / `openaiEdit` 解析上游 JSON 后填 `usage`(若上游缺 `usage`,字段全 0,不阻断)
+3. `src/index.ts` 路由层把 `usage` 原样写进网关响应 body(OpenAI 兼容,资方 SDK 直接读)
+4. `src/db.ts` 写 `usage_logs` 时把 token 字段一并落库(供后续对账查询)
+
+**验收**:smoke 跑一次 generation,响应里能拿到 `usage.input_tokens` 等字段;`SELECT input_tokens FROM usage_logs ORDER BY id DESC LIMIT 1` 非零。
 
 ---
 
