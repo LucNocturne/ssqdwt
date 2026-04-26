@@ -42,6 +42,23 @@ db.exec(`
   );
 `);
 
+// Schema migration: 0 → 1 (v2 /v1/images/edits 支持 + usage 透传)
+{
+  const row = db.query("PRAGMA user_version").get() as { user_version: number };
+  if (row.user_version === 0) {
+    const migrate = db.transaction(() => {
+      db.exec("ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation'");
+      db.exec("ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0");
+      db.exec("ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0");
+      db.exec("ALTER TABLE usage_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0");
+      db.exec("ALTER TABLE usage_logs ADD COLUMN usage_json TEXT");
+      db.exec("CREATE INDEX IF NOT EXISTS idx_usage_op ON usage_logs(op)");
+      db.exec("PRAGMA user_version = 1");
+    });
+    migrate();
+  }
+}
+
 export type ApiKeyRow = {
   id: number;
   key_hash: string;
@@ -142,6 +159,14 @@ export function refundCredits(keyId: number, amount: number, reason: string): vo
   tx();
 }
 
+export type UsagePayload = {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  input_tokens_details?: { text_tokens?: number; image_tokens?: number };
+  output_tokens_details?: { text_tokens?: number; image_tokens?: number };
+};
+
 export function insertUsageLog(args: {
   keyId: number;
   requestId: string;
@@ -151,10 +176,15 @@ export function insertUsageLog(args: {
   credits: number;
   latencyMs: number;
   error?: string;
+  op?: "generation" | "edit";
+  usage?: UsagePayload | null;
 }): void {
+  const op = args.op ?? "generation";
+  const usage = args.usage ?? null;
   db.query(
-    `INSERT INTO usage_logs (key_id, request_id, model, n, status, credits, latency_ms, error, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO usage_logs (key_id, request_id, model, n, status, credits, latency_ms, error, created_at,
+                             op, input_tokens, output_tokens, total_tokens, usage_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     args.keyId,
     args.requestId,
@@ -165,6 +195,11 @@ export function insertUsageLog(args: {
     args.latencyMs,
     args.error ?? null,
     Date.now(),
+    op,
+    usage?.input_tokens ?? 0,
+    usage?.output_tokens ?? 0,
+    usage?.total_tokens ?? 0,
+    usage ? JSON.stringify(usage) : null,
   );
 }
 
