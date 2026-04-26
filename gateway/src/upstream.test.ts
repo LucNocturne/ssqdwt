@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { editImage, generateImage } from "../src/upstream.ts";
+import { editImage, generateImage, sanitizeUsage } from "../src/upstream.ts";
 import { getModelSpec } from "../src/models.ts";
 
 const spec = getModelSpec("img-standard")!;
@@ -39,5 +39,49 @@ describe("upstream mock edit", () => {
     const fakeImage = new File([new Uint8Array([0x89])], "in.png", { type: "image/png" });
     const r = await editImage(spec, "make it red", 1, [fakeImage]);
     expect(r.data[0]?.revised_prompt).toMatch(/\[mock-edit\]/);
+  });
+});
+
+describe("sanitizeUsage", () => {
+  test("drops NaN", () => {
+    const r = sanitizeUsage({ input_tokens: NaN, output_tokens: 5 });
+    expect(r?.input_tokens).toBeUndefined();
+    expect(r?.output_tokens).toBe(5);
+  });
+  test("drops Infinity", () => {
+    const r = sanitizeUsage({ input_tokens: Infinity, output_tokens: 5 });
+    expect(r?.input_tokens).toBeUndefined();
+  });
+  test("drops string fields silently", () => {
+    const r = sanitizeUsage({ input_tokens: "12", output_tokens: 5 } as unknown);
+    expect(r?.input_tokens).toBeUndefined();
+    expect(r?.output_tokens).toBe(5);
+  });
+  test("drops negative", () => {
+    const r = sanitizeUsage({ input_tokens: -1, output_tokens: 5 });
+    expect(r?.input_tokens).toBeUndefined();
+  });
+  test("floors fractional values", () => {
+    const r = sanitizeUsage({ input_tokens: 12.7 });
+    expect(r?.input_tokens).toBe(12);
+  });
+  test("keeps nested details when valid", () => {
+    const r = sanitizeUsage({
+      input_tokens: 10,
+      input_tokens_details: { text_tokens: 4, image_tokens: 6 },
+      output_tokens_details: { text_tokens: NaN, image_tokens: 3 },
+    });
+    expect(r?.input_tokens_details?.text_tokens).toBe(4);
+    expect(r?.output_tokens_details?.text_tokens).toBeUndefined();
+    expect(r?.output_tokens_details?.image_tokens).toBe(3);
+  });
+  test("returns undefined for non-object input", () => {
+    expect(sanitizeUsage(null)).toBeUndefined();
+    expect(sanitizeUsage(undefined)).toBeUndefined();
+    expect(sanitizeUsage("usage")).toBeUndefined();
+    expect(sanitizeUsage(42)).toBeUndefined();
+  });
+  test("returns undefined for empty object", () => {
+    expect(sanitizeUsage({})).toBeUndefined();
   });
 });

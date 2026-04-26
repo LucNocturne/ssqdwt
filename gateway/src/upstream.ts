@@ -48,6 +48,46 @@ export type UpstreamResult = {
   usage?: UpstreamUsage;
 };
 
+/** Coerce arbitrary value to a non-negative integer; reject NaN/Infinity/strings. */
+function safeInt(v: unknown): number | undefined {
+  if (typeof v !== "number") return undefined;
+  if (!Number.isFinite(v)) return undefined;
+  if (v < 0) return undefined;
+  return Math.floor(v);
+}
+
+function safeUsageDetails(v: unknown): UpstreamUsageDetails | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const obj = v as Record<string, unknown>;
+  const out: UpstreamUsageDetails = {};
+  const t = safeInt(obj.text_tokens);
+  const i = safeInt(obj.image_tokens);
+  if (t !== undefined) out.text_tokens = t;
+  if (i !== undefined) out.image_tokens = i;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Validate / coerce upstream usage payload at the boundary.
+ * Drops non-finite values; never lets NaN/Infinity/strings reach response or DB.
+ */
+export function sanitizeUsage(raw: unknown): UpstreamUsage | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: UpstreamUsage = {};
+  const it = safeInt(obj.input_tokens);
+  const ot = safeInt(obj.output_tokens);
+  const tt = safeInt(obj.total_tokens);
+  if (it !== undefined) out.input_tokens = it;
+  if (ot !== undefined) out.output_tokens = ot;
+  if (tt !== undefined) out.total_tokens = tt;
+  const idet = safeUsageDetails(obj.input_tokens_details);
+  const odet = safeUsageDetails(obj.output_tokens_details);
+  if (idet) out.input_tokens_details = idet;
+  if (odet) out.output_tokens_details = odet;
+  return Object.keys(out).length ? out : undefined;
+}
+
 /**
  * NOTE: We intentionally do NOT propagate the client request's AbortSignal
  * to the upstream fetch. If the client disconnects mid-flight, we still let
@@ -182,7 +222,7 @@ async function cpaGenerate(spec: ModelSpec, prompt: string, n: number): Promise<
       data: json.data,
       upstream_quality: json.quality,
       upstream_size: json.size,
-      usage: json.usage,
+      usage: sanitizeUsage(json.usage),
     };
   } catch (err) {
     if (err instanceof UpstreamError) throw err;
@@ -273,7 +313,7 @@ async function cpaEdit(
       data: json.data,
       upstream_quality: json.quality,
       upstream_size: json.size,
-      usage: json.usage,
+      usage: sanitizeUsage(json.usage),
     };
   } catch (err) {
     if (err instanceof UpstreamError) throw err;
