@@ -1,0 +1,6 @@
+# local tool state
+.serena/
+.playwright-mcp/
+
+# auto-generated session snapshots
+**/compact-state.md
