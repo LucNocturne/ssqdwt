@@ -8,51 +8,45 @@
 
 ## 关键修订要点(2026-04-26)
 
-> 经多视角对赌后对原 plan 的三处必改:
+> 经多视角对赌后对原 plan 的两处必改。**范围不变**:i2i + mask + multi-ref 三件套一次性上,vibe coding 一小时级别工作量,无需分 v2 / v2.1。
 
-### ① 范围收紧 — v2 = MVP only image-to-image
-
-mask + multi-ref 推迟到 v2.1。**理由**:plan §五验收"mask 区域只 mask 区域被改 (肉眼验)"已自承不可自动化;捆绑 mask 会把人工视觉验收变成 i2i 发布的瓶颈,反而拖慢 v2 节奏。i2i 可走 6 个自动化用例闭环 → 早 1 周拿到客户实测数据 → 数据驱动 mask 优先级。
-
-### ② 链路风险前置 — probe + 直连 hot path 双轨开发
+### ① 链路风险前置 — probe + 直连 hot path 双轨开发
 
 不再"先 probe、不通再绕"乐观路径。**根据**:
 - `cpaGenerate` 实测用 `application/json` body(见 `src/upstream.ts:78-86`),CPA 主动控 `response_format=b64_json`;**这两点都证明 CPA 不是纯透明代理,而是对 body 做主动封装**。
 - `/v1/images/edits` 是 multipart 端点,与 CPA 现有 JSON 协议层不对称,大概率 CPA **不透传 multipart**。
 
-**应对**:`scripts/probe-edits.sh` 与 `src/upstream.ts:openaiEdit()` 同步开发(各 0.5d):
+**应对**:`scripts/probe-edits.sh` 与 `src/upstream.ts:openaiEdit()` 同步开发(各 ~10-20 min):
 - probe 通 → 走 CPA 路径(零额外依赖)
 - probe 不通 → 立刻切 `openaiEdit()` 直连 `https://api.openai.com/v1/images/edits` + 独立 `OPENAI_API_KEY`
 
-**新增未决问题(Q2 → §十)**:Pro 账号 OAuth token 是绑定 ChatGPT session 的,**不能直接当 OpenAI API key 用**,直连必须独立付费 API key,这撕开了 Pro 包月的成本结构 → 见 ③。
+**新增未决问题(Q2 → §十)**:Pro 账号 OAuth token 是绑定 ChatGPT session 的,**不能直接当 OpenAI API key 用**,直连必须独立付费 API key,这撕开了 Pro 包月的成本结构 → 见 ②。
 
-### ③ 计费 day-1 引入 multiplier,但**数字 conditional**
+### ② 计费 day-1 引入 multiplier,但**数字 conditional**
 
-抛弃 plan §3.3 原推荐"v2 1×、v2.1 调"。**理由**:1× 锚定后向上调价是涨价(高摩擦);差异化锚从一开始设,后续微调成本远低。
+抛弃 plan §3.3 原推荐"v2 1×、v2.1 调"。**理由**:1× 锚定后向上调价是涨价(高摩擦);差异化锚从一开始设,后续微调成本远低。**实施成本 = 一行常量**,不影响范围。
 
-**倍率取决于 ② 的链路结果**:
+**倍率取决于 ① 的链路结果**:
 
 | 链路 | 上游成本基础 | day-1 multiplier | 备注 |
 |:---|:---|:---:|:---|
 | CPA + Pro 包月($200/月封顶) | edit 烧 Pro 配额 ≈ generation × 1.5(多 vision encoder) | **1.5×** | 配额未触限前,边际成本接近零;1.5× 反映"配额烧速差"信号 |
 | 直连 OpenAI Images API + 付费 key | edit 真实 USD/token,~$0.04/张 | **5-10×** | Pro 包月成本结构失效,必须按真实 token 价覆盖 |
 
-**单 multiplier 常量,链路裁决后即填**。文档同步在 v2 上线说明"edit 计费 = generation × N",避免同 model id 误判。
+**单 multiplier 常量,链路裁决后即填**。文档同步在 v2 上线说明"edit 计费 = generation × N"。
 
 ---
 
 ## 一、目标 & 非目标
 
-**Goals(v2 MVP)**
-1. 暴露 `POST /v1/images/edits`,签名与 OpenAI Images API 兼容(**仅 1 张 `image` + `prompt`**)。
+**Goals**
+1. 暴露 `POST /v1/images/edits`,签名与 OpenAI Images API 兼容(`image` + 可选 `mask` + `prompt`,支持 multi-ref `image[]`)。
 2. 复用 v1 的 model 矩阵(`img-{1k|2k|4k}-{w}x{h}`)做尺寸/质量绑定,不引入新参数面。
-3. 复用现有 credits 预扣 / 失败退款 / usage_logs 链路,**day-1 引入 edit multiplier 常量**(数字见「关键修订要点 ③」)。
+3. 复用现有 credits 预扣 / 失败退款 / usage_logs 链路,**day-1 引入 edit multiplier 常量**(数字见「关键修订要点 ②」)。
 4. 输入图大小 / 格式 / 数量统一限制,防 OOM 和 OpenAI 拒。
-5. **probe + 自建 hot path 直连 双轨开发**(见「关键修订要点 ②」),消除 CPA multipart 透传不确定性。
+5. **probe + 自建 hot path 直连 双轨开发**(见「关键修订要点 ①」),消除 CPA multipart 透传不确定性。
 
-**Non-Goals(v2)**
-- **`mask` 蒙版编辑** → v2.1(肉眼验收,不能与 i2i 共发布窗口)
-- **`image[]` 多图参考** → v2.1
+**Non-Goals**
 - 不做 v1 没做的能力:仍不支持 stream / seed / transparent。
 - 不引入图床(图片**仅按 multipart 透传**给上游,不落盘)。
 - 不做风格化预设(那是产品层,不是网关层)。
@@ -306,7 +300,7 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
 
 ## 十、未决问题(需用户拍板)
 
-> v2 MVP 范围内的硬决策项:
+> 硬决策项:
 
 1. **(Q1)CPA 是否透传 multipart?** — probe day-0 必跑,影响整条链路。
 2. **(Q2)若 CPA 不透传,直连 OpenAI Images API 用什么认证?**
@@ -314,7 +308,7 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
    - → **大概率必须独立付费 OPENAI_API_KEY**,Pro 包月成本结构失效,改按真实 token 计费
    - **资方需准备 OpenAI 付费账号 + 预算上限**
 3. **(Q3)edit 烧 Pro 配额是否真比 generation 重?** — 决定 CPA 路径下 multiplier 数字(1.2× / 1.5× / 2×)
-4. ~~是否在 v2 引入 image-to-image 单独定价?~~ **已裁决:day-1 引入 multiplier 常量**(见「关键修订要点 ③」)
-5. ~~输入图最多几张?~~ **已裁决:v2 = 1 张**(MVP),multi-ref 推 v2.1
-6. ~~是否需要把 edit 输出和原图一起返还?~~ 推荐:**不返**,客户本地有原图。
-7. **Zeabur 是否计划迁 VPS?** 如果不迁,**4K edit 几乎不可用**,v2 直接禁 4K edit(只暴露 1K/2K)。
+4. ~~是否在 v2 引入 image-to-image 单独定价?~~ **已裁决:day-1 引入 multiplier 常量**(见「关键修订要点 ②」)
+5. 输入图最多几张:**4 张**(OpenAI 上游支持到 ~10 张)
+6. 是否需要把 edit 输出和原图一起返还? 推荐:**不返**,客户本地有原图。
+7. **Zeabur 是否计划迁 VPS?** 如果不迁,**4K edit 几乎不可用**,可考虑 v2 直接禁 4K edit(只暴露 1K/2K)。
