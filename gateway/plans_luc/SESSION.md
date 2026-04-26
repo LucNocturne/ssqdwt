@@ -1,34 +1,42 @@
-# SESSION · v2 /v1/images/edits 实施
+# SESSION · v2 P1 全修
 
-> 起点 2026-04-26。Plan: `gateway/plans_luc/v2-images-edits-plan.md`(完整 spec,实证已通)。
+> 2026-04-26。Codex 5 路审查发现 6 个 P1,本会话全修完。
+> 详细审查清单:`gateway/plans_luc/ISSUES.md`(P2×14 / P3×6 待续)。
 
-## 现状
+## P1 修复完成
 
-- v1 文生图已上线、跑通(`gateway/src/` 7 文件)
-- v2 plan 已落、CPA multipart 透传已实证(`scripts/probe-edits.sh`)
-- 实测 usage 结构:`input_tokens` / `output_tokens` / `*_tokens_details.{image_tokens,text_tokens}` / `total_tokens`
-- 业务定位:网关 → 资方供应,credits 池对资方无限,multiplier 是供应核算系数
+| # | 任务 | 关键改动 |
+|---|------|---------|
+| 53 | P1#5 cpaEdit 单图改用 `image` | `upstream.ts`: 按 `images.length` 选 `image` 或 `image[]`;`UPSTREAM_MODE` 改 lazy 读;新文件 `upstream-cpa.test.ts` 3 测试 |
+| 54 | P1#1 bodyLimit + auth 顺序 | `index.ts`: 全局中间件按路径选 25MB(edits)/64KB(其他),挪到 auth 前;`MAX_EDIT_BODY_BYTES` 改 lazy 读避免 module-load-once 测试污染 |
+| 55 | P1#2 MIME 真校验 | `index.ts`: 抽 `sniffImageMime()` magic-byte 识别 PNG/JPEG/WEBP;mask 给定时强制 image[0] 必须是 PNG;3 个新攻击测试 |
+| 56 | P1#4 错误脱敏 | `index.ts`: 抽 `redactSecrets()` 用 regex 处理 `Bearer xxx`、`api[-_]?key=xxx`、`sk-xxx`;新文件 `redact.test.ts` 7 测试 |
+| 57 | P1#6 退款回归测试 | `edits.route.test.ts`: 3 个新测试 (upstream fail 退款、insufficient credits 不动余额、validation 失败前不扣) |
+| 58 | P1#3 扣费事务化 | `db.ts`: `beginRequest`(debit + insert pending) / `completeRequest` / `failRequest` 三事务函数替代 debitCredits + insertUsageLog + refundCredits 链;`index.ts` 两路由全改;新增 2 个事务一致性测试 |
 
-## 任务表(§八 9 步,#41 [1] probe 已完成)
+## 验证基线
 
-| ID | 任务 | 状态 | 文件 | 依赖 |
-|:-:|:--|:-:|:--|:--|
-| #43 | [2] upstream.editImage + usage 解析 | pending | src/upstream.ts | — |
-| #44 | [3] db migration | pending | src/db.ts | — |
-| #45 | [5] tokenMultiplier | pending | src/models.ts | — |
-| #46 | [4] /v1/images/edits 路由 | pending | src/index.ts | #43 #44 #45 |
-| #47 | [6] mask PNG header 校验 | pending | src/index.ts | #46 |
-| #48 | [7] 单测 ≥16 用例 | pending | src/*.test.ts | #43-47 |
-| #49 | [8] smoke-edits.sh | pending | scripts/ | #46 #47 |
-| #50 | [9] 文档更新 | pending | docs/ README | 全部 |
+- `bun test` → **77 pass / 0 fail / 195 expect**
+- `tsc --noEmit` → 干净
+- 工作树:`db.ts` `index.ts` `upstream.ts` `edits.route.test.ts` 改;新 `redact.test.ts` `upstream-cpa.test.ts`
+- 未 commit(等用户确认)
 
-## 关键约束(全部源自 v2 plan,执行时不要偏离)
+## 关键架构变更
 
-- **不引图像库**(无 sharp/Image),只读 PNG header 24 字节(§四 + §3.6 B)
-- **图片不落盘**(内存 → fetch FormData → 释放,§四 红线)
-- **不改 v1 路由任何字节**(§九 回滚)
-- **`IMAGES_EDITS_ENABLED=false` env 开关**(§九)
-- **`EDIT_MULTIPLIER=1.5`** 作为 edit 总倍率,在 tokenMultiplier 之上叠加
-- **PRAGMA user_version 0→1 迁移**(§3.4),原行 op='generation' 默认值
-- **usage_json TEXT 列保留嵌套**,同时 input_tokens/output_tokens/total_tokens 单列做整数索引
-- **校验失败的不扣 credits**(§五 5/6/7/8 验收)
+1. **三事务计费**: `beginRequest`(debit+pending 同事务) → upstream → `completeRequest`(success) 或 `failRequest`(fail+refund 同事务)。崩溃在中间窗口会留下 `status='pending'` 行,可由 P3 startup-reconciler 清理。
+2. **真 MIME 守门**: 不再信任客户端 `Content-Type`,只信任前 12 字节 magic。SVG/HTML 伪装 PNG/JPEG → 400。
+3. **错误脱敏**: 任何 CPA 上游返回错误中包含的 Bearer/api-key/sk- 都在落库/打日志前 redact。
+4. **bodyLimit 前置**: 未鉴权 oversize 直接 413,不浪费内存。
+5. **lazy env 读取**: `UPSTREAM_MODE` `MAX_EDIT_BODY_BYTES` 改成函数式读取,解锁多文件测试隔离。
+
+## 后续
+
+- P2(14 条)和 P3(6 条)在 `ISSUES.md` 已分级。重点 P2:
+  - #8 recharge_logs 结构化 ledger
+  - #9 edit 计价纳入 mask/imageCount
+  - #10 /v1/usage 按 op 分桶
+  - #11 user_version 迁移并发竞态
+  - #12 内存放大(streaming multipart)
+  - #13 usage schema 校验
+  - #16 0 并发覆盖
+- 下次会话可起 dual-mode 把 P2 拆 5-6 个并行干。
