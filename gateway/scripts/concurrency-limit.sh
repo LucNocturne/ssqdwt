@@ -18,11 +18,17 @@ cd "$(dirname "$0")/.."
 : "${KEY_HASH_SECRET:=$(openssl rand -hex 32)}"
 : "${PORT:=8788}"
 : "${CPA_BASE_URL:=https://codemo.zeabur.app}"
-: "${MODEL:=img-1k-1024x1024-low}"
-: "${REQ_TIMEOUT:=300}"   # 单请求 curl 超时 (s),给上游够大空间
+: "${MODEL:=img-4k-3840x2160}"
+: "${REQ_TIMEOUT:=600}"   # 单请求 curl 超时 (s),4K 高画质给 10 分钟
+: "${CREDIT_PER_CALL:=16}" # 4K 16:9 = 16cr;若改 model 同步改这里
 
-PHASES=("${@:-20 100}")
+PHASES=("${@:-1000}")
 read -r -a PHASES <<<"${PHASES[*]}"
+
+# 期望尺寸 — 从 MODEL 名解析 (img-{tier}-{w}x{h})
+EXPECTED_W=$(printf '%s' "$MODEL" | sed -nE 's/.*-([0-9]+)x([0-9]+).*/\1/p')
+EXPECTED_H=$(printf '%s' "$MODEL" | sed -nE 's/.*-([0-9]+)x([0-9]+).*/\2/p')
+[[ -z "$EXPECTED_W" || -z "$EXPECTED_H" ]] && { echo "cannot parse expected dim from MODEL=$MODEL"; exit 1; }
 
 WORKDIR=/tmp/concurrency-limit
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
@@ -44,14 +50,14 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 
-# mint key with abundant credits (100 calls @1cr = 100; give buffer)
+# mint key with abundant credits (per-phase N * CREDIT_PER_CALL + 10% buffer)
 TOTAL_NEEDED=0
-for n in "${PHASES[@]}"; do TOTAL_NEEDED=$((TOTAL_NEEDED + n*5)); done
+for n in "${PHASES[@]}"; do TOTAL_NEEDED=$((TOTAL_NEEDED + n*CREDIT_PER_CALL*11/10)); done
 KJ=$(curl -fsS -X POST "http://127.0.0.1:$PORT/admin/keys" \
   -H "X-Admin-Token: $ADMIN" -H "Content-Type: application/json" \
   -d "{\"label\":\"concurrency-test\",\"initial_credits\":$TOTAL_NEEDED}")
 SK=$(printf '%s' "$KJ" | grep -oE 'sk-img-[A-Za-z0-9_-]+')
-echo "key=$SK initial_credits=$TOTAL_NEEDED model=$MODEL"
+echo "key=$SK initial_credits=$TOTAL_NEEDED model=$MODEL expected_dim=${EXPECTED_W}x${EXPECTED_H} cost/call=${CREDIT_PER_CALL}cr"
 echo
 
 # --- helpers ---
@@ -198,6 +204,89 @@ run_phase() {
     echo "── distinct error samples:"
     echo "$ERR_LINES" | awk -F'\t' '{ printf "  http=%s  dur=%ss  err=%s\n", $2, $3, $6 }'
   fi
+
+  # ── 图像质量分析:解码 b64 → 校验尺寸 / 哈希去重 / 字节分布
+  echo
+  echo "── image quality (decoding all OK responses)"
+  python3 - "$DIR" "$EXPECTED_W" "$EXPECTED_H" <<'PY'
+import sys, os, json, base64, hashlib, glob, statistics
+from io import BytesIO
+try:
+    from PIL import Image
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
+
+dir_, ew, eh = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+
+ok_files = []
+with open(os.path.join(dir_, "results.tsv")) as f:
+    for line in f:
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) >= 2 and cols[1] == "200":
+            ok_files.append(os.path.join(dir_, f"r-{cols[0]}.json"))
+
+decoded = 0
+decode_fail = 0
+dim_match = 0
+dim_mismatch = []   # list of (id, w, h)
+byte_sizes = []
+hashes = {}         # sha256 -> [ids]
+modes = {}
+
+for fp in ok_files:
+    rid = os.path.basename(fp)[2:-5]  # r-<id>.json -> <id>
+    try:
+        j = json.load(open(fp))
+        b64 = j["data"][0]["b64_json"]
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        decode_fail += 1
+        continue
+    decoded += 1
+    byte_sizes.append(len(raw))
+    h = hashlib.sha256(raw).hexdigest()
+    hashes.setdefault(h, []).append(rid)
+    if HAS_PIL:
+        try:
+            im = Image.open(BytesIO(raw))
+            w, hh = im.size
+            modes[im.mode] = modes.get(im.mode, 0) + 1
+            if (w, hh) == (ew, eh):
+                dim_match += 1
+            else:
+                dim_mismatch.append((rid, w, hh))
+        except Exception as e:
+            dim_mismatch.append((rid, "decode_err", str(e)[:40]))
+
+dups = {k: v for k, v in hashes.items() if len(v) > 1}
+
+print(f"  decoded={decoded}/{len(ok_files)}  decode_failed={decode_fail}")
+if HAS_PIL:
+    print(f"  dim_match={dim_match}/{decoded}  expected={ew}x{eh}")
+    print(f"  modes={modes}")
+    if dim_mismatch:
+        print(f"  WARN: {len(dim_mismatch)} dim mismatches; first 5:")
+        for rid, w, hh in dim_mismatch[:5]:
+            print(f"    r-{rid}: {w}x{hh}")
+else:
+    print("  (PIL unavailable — skipping dim check)")
+
+if byte_sizes:
+    print(f"  png bytes  min={min(byte_sizes):>9}  median={int(statistics.median(byte_sizes)):>9}  "
+          f"max={max(byte_sizes):>9}  mean={int(statistics.mean(byte_sizes)):>9}")
+    # quality proxy: bytes/pixel — too low => suspiciously simple/compressed/blurry
+    if HAS_PIL and dim_match > 0:
+        bp = [s/(ew*eh) for s in byte_sizes]
+        print(f"  bytes/pixel  min={min(bp):.3f}  median={statistics.median(bp):.3f}  max={max(bp):.3f}")
+
+if dups:
+    print(f"  WARN: {len(dups)} duplicate sha256 hashes (possible cached/identical responses)")
+    for h, ids in list(dups.items())[:3]:
+        print(f"    sha={h[:12]}  ids={','.join(ids[:5])}{'…' if len(ids)>5 else ''}")
+else:
+    print(f"  uniqueness OK: all {decoded} hashes distinct (no upstream caching/dedup)")
+PY
 
   # 余额
   echo "── balance after phase:"
