@@ -180,10 +180,32 @@ export function calculateCost(spec: ModelSpec, n: number): number {
   return spec.creditsPerImage * n;
 }
 
-/** edit 路径定价:creditsPerImage × tokenMultiplier × EDIT_MULTIPLIER × n,向上取整。 */
-export function calculateEditCost(spec: ModelSpec, n: number): number {
-  if (!Number.isInteger(n) || n < 1) {
+/**
+ * edit 路径定价。基础 = creditsPerImage × tokenMultiplier × EDIT_MULTIPLIER × n。
+ * 高成本输入加价(向上取整):
+ *   - mask 同尺寸 inpainting: × MASK_SURCHARGE (default 1.5)
+ *   - 多参考图: 每超过 1 张 +25%
+ */
+export const MASK_SURCHARGE = 1.5;
+export const EXTRA_IMAGE_SURCHARGE = 0.25;
+
+export type EditCostInput = {
+  n: number;
+  hasMask?: boolean;
+  imageCount?: number;
+};
+
+export function calculateEditCost(spec: ModelSpec, input: number | EditCostInput): number {
+  const args: EditCostInput = typeof input === "number" ? { n: input } : input;
+  if (!Number.isInteger(args.n) || args.n < 1) {
     throw new Error("n must be a positive integer");
   }
-  return Math.ceil(spec.creditsPerImage * spec.tokenMultiplier * EDIT_MULTIPLIER * n);
+  const imageCount = args.imageCount ?? 1;
+  if (!Number.isInteger(imageCount) || imageCount < 1) {
+    throw new Error("imageCount must be a positive integer");
+  }
+  let multiplier = EDIT_MULTIPLIER;
+  if (args.hasMask) multiplier *= MASK_SURCHARGE;
+  if (imageCount > 1) multiplier *= 1 + EXTRA_IMAGE_SURCHARGE * (imageCount - 1);
+  return Math.ceil(spec.creditsPerImage * spec.tokenMultiplier * multiplier * args.n);
 }

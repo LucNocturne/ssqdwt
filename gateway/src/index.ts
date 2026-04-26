@@ -231,7 +231,7 @@ const EditPromptSchema = z
   });
 
 /** PNG magic + IHDR width/height. Returns null if not a valid PNG header. */
-function readPngDims(buf: Uint8Array): { width: number; height: number } | null {
+export function readPngDims(buf: Uint8Array): { width: number; height: number } | null {
   if (buf.length < 24) return null;
   // PNG signature 89 50 4E 47 0D 0A 1A 0A
   if (
@@ -252,7 +252,7 @@ function readPngDims(buf: Uint8Array): { width: number; height: number } | null 
 }
 
 /** Sniff true MIME by magic bytes. Never trust client Content-Type. */
-function sniffImageMime(buf: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | null {
+export function sniffImageMime(buf: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | null {
   if (buf.length < 12) return null;
   // PNG
   if (
@@ -475,7 +475,11 @@ app.post(
       );
     }
 
-    const cost = calculateEditCost(spec, n);
+    const cost = calculateEditCost(spec, {
+      n,
+      hasMask: !!mask,
+      imageCount: images.length,
+    });
 
     // ---- atomic debit + pending log row ----
     const logId = beginRequest({
