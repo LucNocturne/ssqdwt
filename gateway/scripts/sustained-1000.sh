@@ -29,7 +29,7 @@ EXPECTED_W=$(printf '%s' "$MODEL" | sed -nE 's/.*-([0-9]+)x([0-9]+).*/\1/p')
 EXPECTED_H=$(printf '%s' "$MODEL" | sed -nE 's/.*-([0-9]+)x([0-9]+).*/\2/p')
 [[ -z "$EXPECTED_W" || -z "$EXPECTED_H" ]] && { echo "cannot parse expected dim"; exit 1; }
 
-WORKDIR=/tmp/sustained-1000
+: "${WORKDIR:=/tmp/sustained-1000}"
 rm -rf "$WORKDIR"; mkdir -p "$WORKDIR"
 OK_DIR="$WORKDIR/ok"; mkdir -p "$OK_DIR"
 ATT_LOG="$WORKDIR/attempts.tsv"      # 每次 attempt 一行: worker_id seq http dur start retries
