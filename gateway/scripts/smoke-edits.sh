@@ -15,7 +15,7 @@ URL="$GATEWAY_URL/v1/images/edits"
 
 # 测试素材
 python3 - "$OUT" <<'PY'
-import sys
+import sys, os
 from PIL import Image, ImageDraw
 out = sys.argv[1]
 img = Image.new('RGB', (1024,1024), 'white')
@@ -30,11 +30,12 @@ m.save(f'{out}/mask.png')
 # bad: wrong-size mask
 m_bad = Image.new('RGBA',(512,512),(0,0,0,0))
 m_bad.save(f'{out}/mask_bad.png')
-# big bogus image > 4MB
-import os
-big = Image.new('RGB',(4000,4000),'white')
-big.save(f'{out}/big.png', optimize=False)
-print(f"big.png size: {os.path.getsize(f'{out}/big.png')} bytes")
+# big >4MB image: random pixel data is incompressible, guarantees size > MAX_INPUT_IMAGE_BYTES
+big = Image.frombytes('RGB', (1600,1600), os.urandom(1600*1600*3))
+big.save(f'{out}/big.png', optimize=False, compress_level=0)
+size = os.path.getsize(f'{out}/big.png')
+print(f"big.png size: {size} bytes")
+assert size > 4 * 1024 * 1024, f"big.png is only {size}B; need >4MB to trigger 413"
 PY
 
 run() {
