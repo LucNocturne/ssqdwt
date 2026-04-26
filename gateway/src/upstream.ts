@@ -1,6 +1,9 @@
 import type { ModelSpec } from "./models.ts";
 
-const UPSTREAM_MODE = (process.env.UPSTREAM_MODE ?? "mock") as "mock" | "cpa";
+const UPSTREAM_MODE_DEFAULT = (process.env.UPSTREAM_MODE ?? "mock") as "mock" | "cpa";
+function currentMode(): "mock" | "cpa" {
+  return (process.env.UPSTREAM_MODE ?? UPSTREAM_MODE_DEFAULT) as "mock" | "cpa";
+}
 const CPA_BASE_URL = process.env.CPA_BASE_URL ?? "http://127.0.0.1:8004";
 const CPA_API_KEY = process.env.CPA_API_KEY ?? "";
 const TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS ?? 120_000);
@@ -56,7 +59,7 @@ export async function generateImage(
   prompt: string,
   n: number,
 ): Promise<UpstreamResult> {
-  if (UPSTREAM_MODE === "mock") return mockGenerate(spec, prompt, n);
+  if (currentMode() === "mock") return mockGenerate(spec, prompt, n);
   return cpaGenerate(spec, prompt, n);
 }
 
@@ -67,7 +70,7 @@ export async function editImage(
   images: File[],
   mask?: File,
 ): Promise<UpstreamResult> {
-  if (UPSTREAM_MODE === "mock") return mockEdit(spec, prompt, n);
+  if (currentMode() === "mock") return mockEdit(spec, prompt, n);
   return cpaEdit(spec, prompt, n, images, mask);
 }
 
@@ -215,7 +218,12 @@ async function cpaEdit(
     fd.append("size", spec.upstream.size);
     fd.append("quality", spec.upstream.quality);
     fd.append("output_format", spec.upstream.output_format);
-    for (const img of images) fd.append("image[]", img, img.name || "image.png");
+    if (images.length === 1) {
+      const img = images[0]!;
+      fd.append("image", img, img.name || "image.png");
+    } else {
+      for (const img of images) fd.append("image[]", img, img.name || "image.png");
+    }
     if (mask) fd.append("mask", mask, mask.name || "mask.png");
 
     const res = await fetch(`${CPA_BASE_URL}/v1/images/edits`, {
@@ -307,4 +315,4 @@ function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n)}...` : s;
 }
 
-export const upstreamMode = UPSTREAM_MODE;
+export const upstreamMode = UPSTREAM_MODE_DEFAULT;
