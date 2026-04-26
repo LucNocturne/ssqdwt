@@ -43,19 +43,40 @@ db.exec(`
 `);
 
 // Schema migration: 0 → 1 (v2 /v1/images/edits 支持 + usage 透传)
+// Use BEGIN IMMEDIATE so concurrent gateway boots can't both decide to migrate.
+// Inside the transaction we re-check user_version + table_info for idempotency.
 {
-  const row = db.query("PRAGMA user_version").get() as { user_version: number };
-  if (row.user_version === 0) {
-    const migrate = db.transaction(() => {
-      db.exec("ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation'");
-      db.exec("ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0");
-      db.exec("ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0");
-      db.exec("ALTER TABLE usage_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0");
-      db.exec("ALTER TABLE usage_logs ADD COLUMN usage_json TEXT");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.query("PRAGMA user_version").get() as { user_version: number };
+    if (row.user_version === 0) {
+      const cols = db
+        .query<{ name: string }, []>("PRAGMA table_info(usage_logs)")
+        .all()
+        .map((c) => c.name);
+      const has = (c: string) => cols.includes(c);
+      if (!has("op")) {
+        db.exec("ALTER TABLE usage_logs ADD COLUMN op TEXT NOT NULL DEFAULT 'generation'");
+      }
+      if (!has("input_tokens")) {
+        db.exec("ALTER TABLE usage_logs ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!has("output_tokens")) {
+        db.exec("ALTER TABLE usage_logs ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!has("total_tokens")) {
+        db.exec("ALTER TABLE usage_logs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!has("usage_json")) {
+        db.exec("ALTER TABLE usage_logs ADD COLUMN usage_json TEXT");
+      }
       db.exec("CREATE INDEX IF NOT EXISTS idx_usage_op ON usage_logs(op)");
       db.exec("PRAGMA user_version = 1");
-    });
-    migrate();
+    }
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
   }
 }
 
@@ -294,15 +315,15 @@ export function summarizeUsage(keyId?: number) {
   if (keyId !== undefined) {
     return db
       .query(
-        `SELECT model, status, COUNT(*) AS count, SUM(credits) AS credits, AVG(latency_ms) AS avg_latency
-         FROM usage_logs WHERE key_id = ? GROUP BY model, status`,
+        `SELECT op, model, status, COUNT(*) AS count, SUM(credits) AS credits, AVG(latency_ms) AS avg_latency
+         FROM usage_logs WHERE key_id = ? GROUP BY op, model, status`,
       )
       .all(keyId);
   }
   return db
     .query(
-      `SELECT key_id, model, status, COUNT(*) AS count, SUM(credits) AS credits
-       FROM usage_logs GROUP BY key_id, model, status`,
+      `SELECT key_id, op, model, status, COUNT(*) AS count, SUM(credits) AS credits
+       FROM usage_logs GROUP BY key_id, op, model, status`,
     )
     .all();
 }
