@@ -263,6 +263,39 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
 
 **验收**:smoke 跑一次 generation,响应里能拿到 `usage.input_tokens_details.image_tokens` 等嵌套字段;`SELECT json_extract(usage_json, '$.input_tokens_details.image_tokens') FROM usage_logs ORDER BY id DESC LIMIT 1` 非零。
 
+### 3.6 同行对照补强项(2026-04-26 调研)
+
+> 调研 one-api(32.5k)/ new-api / one-hub(2.8k)/ LiteLLM(44.7k)/ Portkey / Helicone / Cloudflare AI Gateway 后,对照本 plan 抽取 **2 项必抄 + 1 项零成本打桩 + 6 项明确不抄**。
+
+#### ✅ 必抄(直接进 v2)
+
+**(A) 尺寸系数计费**(抄 new-api / one-hub) — 替代 §3.3 的固定 `EDIT_MULTIPLIER=1.5`
+
+理由:实证 1k medium edit ≈ 1270 tokens,4k 应线性更高;固定常量无法反映档位差。已有 `models.ts` 矩阵,加一列 `tokenMultiplier` 即可。
+
+落地:`ModelSpec` 增 `tokenMultiplier: number` 字段,`priceFromPixels()` 计算后乘以该系数;1k=1.0 / 2k=4.0 / 4k=8.5(按像素比例,后续以 24h 实测调优)。**~2h。**
+
+**(B) 输入图格式归一化校验**(抄 LiteLLM 思路,精简版) — 防 mask 格式不符上游静默拒
+
+理由:OpenAI `/v1/images/edits` 要求 mask 与 image 同尺寸 PNG with alpha;客户传 JPEG mask 或尺寸错配会被上游 400 拒,网关已扣 credits 后退款,体验差。
+
+落地:在 `cpaEdit()` 透传前读 PNG header 12 字节(IHDR chunk)取宽高,**不解码像素**;若 mask MIME ≠ PNG 或宽高 ≠ image[0],400 拒并不扣 credits。原 §四"不引 sharp"红线保留。**~0.5d。**
+
+#### 🟡 零成本打桩
+
+**(C) `x-request-id` 响应头**(抄 Portkey) — 每个请求生成 UUID,写入响应头 + `usage_logs.request_id` 列,为将来异步任务/客户排查打桩。**~0.1d,顺手做。**
+
+#### ❌ 明确不抄
+
+| feature | 抄者 | 不抄理由 |
+|:---|:---|:---|
+| 多渠道轮询 / fallback | one-api | 单链路 CPA,架构不匹配 |
+| C 端充值 UI / 支付 | chatnio / new-api | 资方供应口径,credit 池无限,无 C 端 |
+| b64_json → 托管 URL | one-hub / LiteLLM | 引入存储依赖 + GDPR 风险,违反 §四"不落盘"红线 |
+| 流式图像 SSE | 实验性网关 | 上游 gpt-image-2 硬不支持 |
+| prompt 模板注入 | one-hub | 侵入客户创作语义,违反网关透明性 |
+| 全量请求体落库 | Helicone | base64 体积巨大,与 §四"图像 byte 不入日志"冲突 |
+
 ---
 
 ## 四、安全与限制
@@ -330,13 +363,15 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
 | 阶段 | 内容 | 工时 |
 |:---|:---|:---:|
 | 0. probe | scripts/probe-edits.sh,实测 CPA 5 个场景 | 0.5 d |
-| 1. upstream | upstream.ts editImage / cpaEdit / mockEdit | 0.5 d |
-| 2. 路由 + 鉴权 | index.ts /v1/images/edits + bodyLimit + multipart 解析 | 0.5 d |
-| 3. db 迁移 | usage_logs.op 列 + PRAGMA user_version 启动迁移 | 0.25 d |
-| 4. 单测 | upstream + index 路由 ≥ 12 用例 | 0.5 d |
-| 5. smoke | scripts/smoke-edits.sh,文档更新 | 0.25 d |
-| 6. 文档 | docs/image-config.md §二 把 edit/inpaint 改为 ✅ | 0.25 d |
-| **合计** | | **~2.75 d** |
+| 1. upstream | upstream.ts editImage / cpaEdit / mockEdit + usage 解析 | 0.5 d |
+| 2. 路由 + 鉴权 | index.ts /v1/images/edits + bodyLimit + multipart 解析 + `x-request-id`(§3.6 C) | 0.6 d |
+| 3. db 迁移 | usage_logs.op + token 列 + usage_json + request_id + PRAGMA user_version | 0.25 d |
+| 4. 计费补强 | ModelSpec.tokenMultiplier + priceFromPixels 集成(§3.6 A) | 0.25 d |
+| 5. 输入图归一化 | PNG header 解析 + mask 同尺寸校验(§3.6 B) | 0.5 d |
+| 6. 单测 | upstream + index 路由 + 计费 + 归一化 ≥ 16 用例 | 0.6 d |
+| 7. smoke | scripts/smoke-edits.sh | 0.25 d |
+| 8. 文档 | docs/image-config.md §三 把 edit/inpaint 改为 ✅ | 0.25 d |
+| **合计** | | **~3.7 d** |
 
 ---
 
@@ -344,12 +379,14 @@ CREATE INDEX idx_usage_op ON usage_logs(op);
 
 ```
 [1] feat(scripts): 新增 probe-edits 探针脚本                           # 阶段 0
-[2] feat(upstream): editImage + cpaEdit + mockEdit                      # 阶段 1
-[3] feat(db): usage_logs 加 op 列 + 迁移                                # 阶段 3
-[4] feat(api): /v1/images/edits 路由 + multipart 校验                   # 阶段 2
-[5] test: edit 路径单测 ≥ 12 用例                                       # 阶段 4
-[6] feat(scripts): smoke-edits.sh                                       # 阶段 5
-[7] docs: image-config.md / README 更新 edit 能力                       # 阶段 6
+[2] feat(upstream): editImage + cpaEdit + mockEdit + usage 解析         # 阶段 1
+[3] feat(db): usage_logs 加 op + token + usage_json + request_id 列    # 阶段 3
+[4] feat(api): /v1/images/edits 路由 + multipart + x-request-id        # 阶段 2
+[5] feat(billing): tokenMultiplier 尺寸系数(§3.6 A)                   # 阶段 4
+[6] feat(api): mask PNG header 校验 + 同尺寸守门(§3.6 B)              # 阶段 5
+[7] test: edit 路径单测 ≥ 16 用例                                       # 阶段 6
+[8] feat(scripts): smoke-edits.sh                                       # 阶段 7
+[9] docs: image-config.md / README 更新 edit 能力                       # 阶段 8
 ```
 
 每 commit 单独跑 `bun test` 必过。
