@@ -99,7 +99,21 @@ export type ModelSpec = {
     output_format: "png" | "webp";
   };
   creditsPerImage: number;
+  /**
+   * 尺寸系数(§3.6 A):edit 路径下乘到 creditsPerImage 上反映上游 token 烧速差。
+   * 1k=1.0 / 2k=4.0 / 4k=8.5(按像素近似线性);generation 不使用,保持原定价。
+   */
+  tokenMultiplier: number;
 };
+
+/** edit 总倍率,叠加在 tokenMultiplier 之上。reflective:edit 比 generation 烧 ~1.5× 配额。 */
+export const EDIT_MULTIPLIER = 1.5;
+
+function tokenMultiplierFor(longEdge: number): number {
+  if (longEdge <= 1024) return 1.0;
+  if (longEdge <= 2048) return 4.0;
+  return 8.5;
+}
 
 /**
  * 派生所有 valid 规格,命名 = `img-{1k|2k|4k}-{w}x{h}`,默认 high 画质。
@@ -115,6 +129,7 @@ export const MODEL_SPECS: Record<string, ModelSpec> = (() => {
     description: "1024×1024,medium 画质。最便宜的兼容入口,适合缩略图、占位图。",
     upstream: { model: "gpt-image-2", size: "1024x1024", quality: "medium", output_format: "png" },
     creditsPerImage: 1,
+    tokenMultiplier: 1.0,
   };
 
   specs["img-1k-1024x1024-low"] = {
@@ -122,6 +137,7 @@ export const MODEL_SPECS: Record<string, ModelSpec> = (() => {
     description: "1024×1024,low 画质。极速档(~10s),适合大批量草图/占位。",
     upstream: { model: "gpt-image-2", size: "1024x1024", quality: "low", output_format: "png" },
     creditsPerImage: 1,
+    tokenMultiplier: 1.0,
   };
 
   for (const res of RESOLUTIONS) {
@@ -135,6 +151,7 @@ export const MODEL_SPECS: Record<string, ModelSpec> = (() => {
         description: `${w}×${h} (${res.toUpperCase()} ${asp.replace("x", ":")}),high 画质。`,
         upstream: { model: "gpt-image-2", size: `${w}x${h}`, quality: "high", output_format: "png" },
         creditsPerImage: priceFromPixels(px),
+        tokenMultiplier: tokenMultiplierFor(LONG_EDGE[res]),
       };
     }
   }
@@ -161,4 +178,12 @@ export function calculateCost(spec: ModelSpec, n: number): number {
     throw new Error("n must be a positive integer");
   }
   return spec.creditsPerImage * n;
+}
+
+/** edit 路径定价:creditsPerImage × tokenMultiplier × EDIT_MULTIPLIER × n,向上取整。 */
+export function calculateEditCost(spec: ModelSpec, n: number): number {
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error("n must be a positive integer");
+  }
+  return Math.ceil(spec.creditsPerImage * spec.tokenMultiplier * EDIT_MULTIPLIER * n);
 }
