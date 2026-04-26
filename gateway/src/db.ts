@@ -203,6 +203,93 @@ export function insertUsageLog(args: {
   );
 }
 
+/** Atomic: debit balance + insert pending usage_logs row in one transaction.
+ * Returns logId on success, null on insufficient credits / disabled key. */
+export function beginRequest(args: {
+  keyId: number;
+  cost: number;
+  requestId: string;
+  model: string;
+  n: number;
+  op: "generation" | "edit";
+}): number | null {
+  const tx = db.transaction(() => {
+    const debit = db
+      .query(
+        "UPDATE api_keys SET credits_balance = credits_balance - ? WHERE id = ? AND credits_balance >= ? AND disabled = 0",
+      )
+      .run(args.cost, args.keyId, args.cost);
+    if (debit.changes !== 1) return null;
+    const inserted = db
+      .query(
+        `INSERT INTO usage_logs
+           (key_id, request_id, model, n, status, credits, latency_ms, error, created_at,
+            op, input_tokens, output_tokens, total_tokens, usage_json)
+         VALUES (?, ?, ?, ?, 'pending', ?, 0, NULL, ?, ?, 0, 0, 0, NULL)
+         RETURNING id`,
+      )
+      .get(
+        args.keyId,
+        args.requestId,
+        args.model,
+        args.n,
+        args.cost,
+        Date.now(),
+        args.op,
+      ) as { id: number } | null;
+    return inserted?.id ?? null;
+  });
+  return tx();
+}
+
+/** Flip pending row to 'success' and stamp tokens + final latency. */
+export function completeRequest(args: {
+  logId: number;
+  latencyMs: number;
+  usage?: UsagePayload | null;
+}): void {
+  const usage = args.usage ?? null;
+  db.query(
+    `UPDATE usage_logs
+        SET status = 'success', latency_ms = ?,
+            input_tokens = ?, output_tokens = ?, total_tokens = ?, usage_json = ?
+      WHERE id = ?`,
+  ).run(
+    args.latencyMs,
+    usage?.input_tokens ?? 0,
+    usage?.output_tokens ?? 0,
+    usage?.total_tokens ?? 0,
+    usage ? JSON.stringify(usage) : null,
+    args.logId,
+  );
+}
+
+/** Atomic: flip pending → failed + refund balance + insert refund recharge_log. */
+export function failRequest(args: {
+  logId: number;
+  keyId: number;
+  cost: number;
+  requestId: string;
+  latencyMs: number;
+  error: string;
+}): void {
+  const tx = db.transaction(() => {
+    db.query(
+      "UPDATE usage_logs SET status = 'failed', latency_ms = ?, error = ? WHERE id = ?",
+    ).run(args.latencyMs, args.error, args.logId);
+    if (args.cost > 0) {
+      db.query("UPDATE api_keys SET credits_balance = credits_balance + ? WHERE id = ?").run(
+        args.cost,
+        args.keyId,
+      );
+      db.query(
+        "INSERT INTO recharge_logs (key_id, delta, reason, created_at) VALUES (?, ?, ?, ?)",
+      ).run(args.keyId, args.cost, `refund:${args.requestId}`, Date.now());
+    }
+  });
+  tx();
+}
+
 export function summarizeUsage(keyId?: number) {
   if (keyId !== undefined) {
     return db

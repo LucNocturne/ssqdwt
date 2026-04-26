@@ -3,10 +3,11 @@ import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 import { authMiddleware, requestIdMiddleware } from "./auth.ts";
 import {
-  debitCredits,
+  beginRequest,
+  completeRequest,
+  failRequest,
   findKeyById,
   insertUsageLog,
-  refundCredits,
   summarizeUsage,
 } from "./db.ts";
 import {
@@ -19,7 +20,8 @@ import { adminApp } from "./admin.ts";
 import { editImage, generateImage, UpstreamError, upstreamMode } from "./upstream.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
-const MAX_EDIT_BODY_BYTES = Number(process.env.MAX_EDIT_BODY_BYTES ?? 25 * 1024 * 1024);
+const editBodyLimit = () =>
+  Number(process.env.MAX_EDIT_BODY_BYTES ?? 25 * 1024 * 1024);
 const MAX_INPUT_IMAGE_BYTES = Number(process.env.MAX_INPUT_IMAGE_BYTES ?? 4 * 1024 * 1024);
 const MAX_INPUT_IMAGES = Number(process.env.MAX_INPUT_IMAGES ?? 4);
 const MAX_PROMPT_BYTES = 32 * 1024;
@@ -29,10 +31,13 @@ const IMAGES_EDITS_ENABLED = (process.env.IMAGES_EDITS_ENABLED ?? "true") !== "f
 const app = new Hono();
 app.use("*", requestIdMiddleware);
 app.use("*", async (c, next) => {
-  // /v1/images/edits has its own larger limit; skip the 64KB global gate.
-  if (c.req.path === "/v1/images/edits") return next();
+  // Apply body limits BEFORE auth so unauthenticated/wrong-method requests
+  // can't waste memory. /v1/images/edits gets the larger 25MB cap; everything
+  // else gets the default 64KB cap.
+  const isEditsPath = c.req.path === "/v1/images/edits";
+  const maxSize = isEditsPath ? editBodyLimit() : MAX_BODY_BYTES;
   return bodyLimit({
-    maxSize: MAX_BODY_BYTES,
+    maxSize,
     onError: (cc) =>
       cc.json({ error: { type: "invalid_request", message: "request body too large" } }, 413),
   })(c, next);
@@ -120,8 +125,16 @@ app.post("/v1/images/generations", async (c) => {
 
   const cost = calculateCost(spec, n);
 
-  // ---- 2. atomic debit ----
-  if (!debitCredits(key.id, cost)) {
+  // ---- 2. atomic debit + pending log row ----
+  const logId = beginRequest({
+    keyId: key.id,
+    cost,
+    requestId,
+    model,
+    n,
+    op: "generation",
+  });
+  if (logId === null) {
     insertUsageLog({
       keyId: key.id,
       requestId,
@@ -147,17 +160,7 @@ app.post("/v1/images/generations", async (c) => {
   try {
     const upstream = await generateImage(spec, prompt, n);
     const latencyMs = Math.round(performance.now() - t0);
-    insertUsageLog({
-      keyId: key.id,
-      requestId,
-      model,
-      n,
-      status: "success",
-      credits: cost,
-      latencyMs,
-      op: "generation",
-      usage: upstream.usage ?? null,
-    });
+    completeRequest({ logId, latencyMs, usage: upstream.usage ?? null });
     return c.json({
       created: upstream.created,
       model,
@@ -167,20 +170,19 @@ app.post("/v1/images/generations", async (c) => {
         : { credits: cost, n },
     });
   } catch (err) {
-    refundCredits(key.id, cost, requestId);
     const latencyMs = Math.round(performance.now() - t0);
     const isUpstream = err instanceof UpstreamError;
     const status = isUpstream ? err.status : 502;
     const publicMessage = isUpstream ? err.message : "upstream error";
-    const detail = isUpstream ? (err.detail ?? "") : (err as Error).message;
+    const detail = redactSecrets(
+      isUpstream ? (err.detail ?? "") : (err as Error).message,
+    );
 
-    insertUsageLog({
+    failRequest({
+      logId,
       keyId: key.id,
+      cost,
       requestId,
-      model,
-      n,
-      status: "failed",
-      credits: 0,
       latencyMs,
       error: detail ? `${publicMessage} | ${detail}` : publicMessage,
     });
@@ -203,6 +205,17 @@ app.post("/v1/images/generations", async (c) => {
 function truncateForLog(s: string, n: number): string {
   const safe = s.replace(/[\r\n]+/g, " ");
   return safe.length > n ? `${safe.slice(0, n)}...` : safe;
+}
+
+/**
+ * Redact secrets that may appear in upstream error bodies before persisting/logging.
+ * Covers Authorization/Bearer tokens, common api-key shapes, sk-* tokens.
+ */
+export function redactSecrets(s: string): string {
+  return s
+    .replace(/\b(authorization|bearer|api[-_]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\bBearer\s+[A-Za-z0-9._\-]+/gi, "Bearer [REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9._\-]{8,}/g, "sk-[REDACTED]");
 }
 
 // ============================================================
@@ -238,13 +251,38 @@ function readPngDims(buf: Uint8Array): { width: number; height: number } | null 
   return { width, height };
 }
 
+/** Sniff true MIME by magic bytes. Never trust client Content-Type. */
+function sniffImageMime(buf: Uint8Array): "image/png" | "image/jpeg" | "image/webp" | null {
+  if (buf.length < 12) return null;
+  // PNG
+  if (
+    buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+    buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return "image/jpeg";
+  }
+  // WEBP: "RIFF" .... "WEBP"
+  if (
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+/** Read at most n bytes from a File. Files are already capped at MAX_INPUT_IMAGE_BYTES. */
+async function readHead(file: File, n: number): Promise<Uint8Array> {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  return buf.subarray(0, Math.min(n, buf.byteLength));
+}
+
 app.post(
   "/v1/images/edits",
-  bodyLimit({
-    maxSize: MAX_EDIT_BODY_BYTES,
-    onError: (c) =>
-      c.json({ error: { type: "invalid_request", message: "request body too large" } }, 413),
-  }),
   async (c) => {
     const key = c.get("apiKey");
     const requestId = c.get("requestId");
@@ -296,6 +334,7 @@ app.post(
         400,
       );
     }
+    const sniffedMimes: ("image/png" | "image/jpeg" | "image/webp")[] = [];
     for (const img of images) {
       if (img.size > MAX_INPUT_IMAGE_BYTES) {
         return c.json(
@@ -303,17 +342,20 @@ app.post(
           413,
         );
       }
-      if (!ALLOWED_INPUT_MIME.has(img.type)) {
+      const head = await readHead(img, 24);
+      const sniffed = sniffImageMime(head);
+      if (!sniffed || !ALLOWED_INPUT_MIME.has(sniffed)) {
         return c.json(
           {
             error: {
               type: "invalid_request",
-              message: `unsupported image format '${img.type}'`,
+              message: "unsupported image format (must be png/jpeg/webp by content)",
             },
           },
           400,
         );
       }
+      sniffedMimes.push(sniffed);
     }
 
     // ---- mask (optional) ----
@@ -326,26 +368,35 @@ app.post(
           413,
         );
       }
-      if (mask.type !== "image/png") {
+      const maskHead = await readHead(mask, 24);
+      if (sniffImageMime(maskHead) !== "image/png") {
         return c.json(
           { error: { type: "invalid_request", message: "mask must be PNG" } },
           400,
         );
       }
-      const maskBytes = new Uint8Array(await mask.arrayBuffer()).slice(0, 24);
-      const maskDims = readPngDims(maskBytes);
+      const maskDims = readPngDims(maskHead);
       if (!maskDims) {
         return c.json(
           { error: { type: "invalid_request", message: "mask is not a valid PNG" } },
           400,
         );
       }
-      const firstImage = images[0]!;
-      let imgDims: { width: number; height: number } | null = null;
-      if (firstImage.type === "image/png") {
-        const imgBytes = new Uint8Array(await firstImage.arrayBuffer()).slice(0, 24);
-        imgDims = readPngDims(imgBytes);
+      // When mask is given, image[0] MUST be a real PNG so we can compare dims.
+      if (sniffedMimes[0] !== "image/png") {
+        return c.json(
+          {
+            error: {
+              type: "invalid_request",
+              message: "image[0] must be PNG when mask is provided",
+            },
+          },
+          400,
+        );
       }
+      const firstImage = images[0]!;
+      const imgHead = await readHead(firstImage, 24);
+      const imgDims = readPngDims(imgHead);
       if (
         imgDims &&
         (imgDims.width !== maskDims.width || imgDims.height !== maskDims.height)
@@ -426,8 +477,16 @@ app.post(
 
     const cost = calculateEditCost(spec, n);
 
-    // ---- atomic debit ----
-    if (!debitCredits(key.id, cost)) {
+    // ---- atomic debit + pending log row ----
+    const logId = beginRequest({
+      keyId: key.id,
+      cost,
+      requestId,
+      model,
+      n,
+      op: "edit",
+    });
+    if (logId === null) {
       insertUsageLog({
         keyId: key.id,
         requestId,
@@ -454,17 +513,7 @@ app.post(
     try {
       const upstream = await editImage(spec, prompt, n, images, mask);
       const latencyMs = Math.round(performance.now() - t0);
-      insertUsageLog({
-        keyId: key.id,
-        requestId,
-        model,
-        n,
-        status: "success",
-        credits: cost,
-        latencyMs,
-        op: "edit",
-        usage: upstream.usage ?? null,
-      });
+      completeRequest({ logId, latencyMs, usage: upstream.usage ?? null });
       return c.json({
         created: upstream.created,
         model,
@@ -474,23 +523,21 @@ app.post(
           : { credits: cost, n },
       });
     } catch (err) {
-      refundCredits(key.id, cost, requestId);
       const latencyMs = Math.round(performance.now() - t0);
       const isUpstream = err instanceof UpstreamError;
       const status = isUpstream ? err.status : 502;
       const publicMessage = isUpstream ? err.message : "upstream error";
-      const detail = isUpstream ? (err.detail ?? "") : (err as Error).message;
+      const detail = redactSecrets(
+        isUpstream ? (err.detail ?? "") : (err as Error).message,
+      );
 
-      insertUsageLog({
+      failRequest({
+        logId,
         keyId: key.id,
+        cost,
         requestId,
-        model,
-        n,
-        status: "failed",
-        credits: 0,
         latencyMs,
         error: detail ? `${publicMessage} | ${detail}` : publicMessage,
-        op: "edit",
       });
       console.error(
         `[${requestId}] upstream_error_edit key=${key.id} model=${model} status=${status} detail=${truncateForLog(detail, 200)}`,
