@@ -45,7 +45,7 @@ app.use("*", async (c, next) => {
 
 // ---------- public health ----------
 app.get("/health", (c) =>
-  c.json({ status: "ok", upstream: upstreamMode, time: new Date().toISOString() }),
+  c.json({ status: "ok", time: new Date().toISOString() }),
 );
 
 // ---------- /admin/* (separate token) ----------
