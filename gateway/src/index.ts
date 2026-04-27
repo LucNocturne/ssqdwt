@@ -16,6 +16,10 @@ import {
   calculateEditCost,
   getModelSpec,
   listModels,
+  resolveDims,
+  isValidCombo,
+  type Aspect,
+  type Resolution,
 } from "./models.ts";
 import { adminApp } from "./admin.ts";
 import { editImage, generateImage, UpstreamError, upstreamMode } from "./upstream.ts";
@@ -64,6 +68,17 @@ app.use("/v1/*", authMiddleware);
 
 app.get("/v1/models", (c) => c.json({ object: "list", data: listModels() }));
 
+// ---------- OpenRouter-style compatibility ----------
+// OpenRouter-style image generation uses /api/v1/chat/completions with
+// modalities:["image"]. We expose a thin compatibility layer while keeping
+// /v1/images/generations as the native gateway API.
+app.use("/api/v1/*", authMiddleware);
+
+app.get("/api/v1/models", (c) => {
+  const outputModalities = c.req.query("output_modalities");
+  return c.json({ data: listOpenRouterModels(outputModalities) });
+});
+
 app.get("/v1/usage", (c) => {
   const key = c.get("apiKey");
   const fresh = findKeyById(key.id);
@@ -85,6 +100,290 @@ const ImagesReq = z.object({
       message: "prompt exceeds byte limit",
     }),
   n: z.number().int().min(1).max(8).default(1),
+});
+
+const OpenRouterChatReq = z.object({
+  model: z.string().min(1).max(128).optional(),
+  messages: z.array(z.object({
+    role: z.string().optional(),
+    content: z.unknown(),
+  })).min(1),
+  modalities: z.array(z.enum(["text", "image", "audio"])).optional(),
+  image_config: z.object({
+    aspect_ratio: z.string().optional(),
+    image_size: z.string().optional(),
+    size: z.string().optional(),
+    quality: z.string().optional(),
+  }).passthrough().optional(),
+  n: z.number().int().min(1).max(8).optional(),
+  stream: z.boolean().optional(),
+});
+
+type OpenRouterImageConfig = z.infer<typeof OpenRouterChatReq>["image_config"];
+
+function listOpenRouterModels(outputModalities?: string) {
+  const requested = (outputModalities ?? "image")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const includeImages =
+    requested.length === 0 ||
+    requested.includes("all") ||
+    requested.includes("image");
+  if (!includeImages) return [];
+
+  return listModels().map((m) => ({
+    id: m.id,
+    canonical_slug: m.id,
+    name: m.id,
+    created: 1777161600,
+    description: m.description,
+    context_length: 8192,
+    architecture: {
+      input_modalities: ["text"],
+      output_modalities: ["image"],
+      tokenizer: "unknown",
+      instruct_type: null,
+    },
+    pricing: {
+      prompt: "0",
+      completion: "0",
+      request: "0",
+      image: "0",
+      web_search: "0",
+      internal_reasoning: "0",
+      input_cache_read: "0",
+      input_cache_write: "0",
+    },
+    top_provider: {
+      context_length: 8192,
+      max_completion_tokens: null,
+      is_moderated: true,
+    },
+    per_request_limits: null,
+    supported_parameters: ["modalities", "image_config"],
+    default_parameters: null,
+    expiration_date: null,
+    size: m.size,
+    quality: m.quality,
+  }));
+}
+
+function normalizeResolution(v: string | undefined): Resolution | null {
+  const s = v?.trim().toLowerCase();
+  if (!s) return null;
+  if (s === "1k") return "1k";
+  if (s === "2k") return "2k";
+  if (s === "4k") return "4k";
+  return null;
+}
+
+function normalizeAspect(v: string | undefined): Aspect | null {
+  const s = v?.trim().toLowerCase().replace(":", "x") as Aspect | undefined;
+  if (!s) return null;
+  return isValidCombo("2k", s) || isValidCombo("1k", s) || isValidCombo("4k", s)
+    ? s
+    : null;
+}
+
+function modelForExactSize(size: string | undefined, quality: string | undefined): string | null {
+  if (!size) return null;
+  const q = quality?.trim().toLowerCase();
+  const models = listModels().filter((m) => m.size === size);
+  if (q) {
+    const exact = models.find((m) => m.quality === q);
+    if (exact) return exact.id;
+  }
+  const standard = models.find((m) => m.id === "img-standard");
+  if (standard) return standard.id;
+  return models[0]?.id ?? null;
+}
+
+function modelFromImageConfig(model: string | undefined, imageConfig: OpenRouterImageConfig): string {
+  if (model && getModelSpec(model)) return model;
+
+  const exactSize = modelForExactSize(imageConfig?.size, imageConfig?.quality);
+  if (exactSize) return exactSize;
+
+  const res = normalizeResolution(imageConfig?.image_size) ?? "1k";
+  const aspect =
+    normalizeAspect(imageConfig?.aspect_ratio) ??
+    (res === "4k" ? "16x9" : "1x1");
+  if (isValidCombo(res, aspect)) {
+    const [w, h] = resolveDims(res, aspect);
+    const bySize = modelForExactSize(`${w}x${h}`, imageConfig?.quality);
+    if (bySize) return bySize;
+  }
+
+  return "img-standard";
+}
+
+function messageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const obj = part as Record<string, unknown>;
+      if (typeof obj.text === "string") return obj.text;
+      if (typeof obj.content === "string") return obj.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractPrompt(messages: { role?: string; content?: unknown }[]): string {
+  const user = [...messages].reverse().find((m) => (m.role ?? "user") === "user");
+  return messageText(user?.content);
+}
+
+app.post("/api/v1/chat/completions", async (c) => {
+  const key = c.get("apiKey");
+  const requestId = c.get("requestId");
+  const t0 = performance.now();
+
+  const body = await c.req.json().catch(() => null);
+  const parsed = OpenRouterChatReq.safeParse(body);
+  if (!parsed.success) {
+    return c.json(
+      {
+        error: {
+          type: "invalid_request",
+          message: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "),
+        },
+      },
+      400,
+    );
+  }
+
+  const modalities = parsed.data.modalities ?? ["image"];
+  if (!modalities.includes("image")) {
+    return c.json(
+      { error: { type: "invalid_request", message: "Only image output is supported. Set modalities:['image']." } },
+      400,
+    );
+  }
+  if (parsed.data.stream) {
+    return c.json(
+      { error: { type: "invalid_request", message: "stream is not supported by this gateway" } },
+      400,
+    );
+  }
+
+  const prompt = extractPrompt(parsed.data.messages);
+  const promptParsed = ImagesReq.shape.prompt.safeParse(prompt);
+  if (!promptParsed.success) {
+    return c.json(
+      {
+        error: {
+          type: "invalid_request",
+          message: promptParsed.error.issues.map((i) => `prompt: ${i.message}`).join("; "),
+        },
+      },
+      400,
+    );
+  }
+
+  const model = modelFromImageConfig(parsed.data.model, parsed.data.image_config);
+  const spec = getModelSpec(model);
+  if (!spec) {
+    return c.json(
+      { error: { type: "invalid_request", message: `Unknown model '${model}'. See GET /api/v1/models?output_modalities=image.` } },
+      400,
+    );
+  }
+
+  const n = parsed.data.n ?? 1;
+  const cost = calculateCost(spec, n);
+  const logId = beginRequest({
+    keyId: key.id,
+    cost,
+    requestId,
+    model,
+    n,
+    op: "generation",
+  });
+  if (logId === null) {
+    insertUsageLog({
+      keyId: key.id,
+      requestId,
+      model,
+      n,
+      status: "rejected",
+      credits: 0,
+      latencyMs: Math.round(performance.now() - t0),
+      error: "insufficient_credits",
+    });
+    return c.json(
+      { error: { type: "insufficient_credits", message: `This request costs ${cost} credits.` } },
+      402,
+    );
+  }
+
+  try {
+    const upstream = await generateImage(spec, promptParsed.data, n);
+    const latencyMs = Math.round(performance.now() - t0);
+    completeRequest({ logId, latencyMs, usage: upstream.usage ?? null });
+    return c.json({
+      id: `chatcmpl-${requestId}`,
+      object: "chat.completion",
+      created: upstream.created,
+      model,
+      choices: [
+        {
+          index: 0,
+          finish_reason: "stop",
+          message: {
+            role: "assistant",
+            content: "Image generated.",
+            images: upstream.data.map((img) => ({
+              type: "image_url",
+              image_url: {
+                url: img.b64_json
+                  ? `data:image/png;base64,${img.b64_json}`
+                  : (img.url ?? ""),
+              },
+            })),
+          },
+        },
+      ],
+      usage: {
+        prompt_tokens: upstream.usage?.input_tokens ?? 0,
+        completion_tokens: upstream.usage?.output_tokens ?? 0,
+        total_tokens: upstream.usage?.total_tokens ?? 0,
+      },
+    });
+  } catch (err) {
+    const latencyMs = Math.round(performance.now() - t0);
+    const isUpstream = err instanceof UpstreamError;
+    const status = isUpstream ? err.status : 502;
+    const publicMessage = isUpstream ? err.message : "upstream error";
+    const detail = redactSecrets(
+      isUpstream ? (err.detail ?? "") : (err as Error).message,
+    );
+    failRequest({
+      logId,
+      keyId: key.id,
+      cost,
+      requestId,
+      latencyMs,
+      error: detail ? `${publicMessage} | ${detail}` : publicMessage,
+    });
+    console.error(
+      `[${requestId}] openrouter_upstream_error key=${key.id} model=${model} status=${status} detail=${truncateForLog(detail, 200)}`,
+    );
+    return c.json(
+      {
+        error: {
+          type: "upstream_error",
+          message: publicMessage,
+          retriable: isUpstream ? err.retriable : true,
+        },
+      },
+      coerceClientStatus(status),
+    );
+  }
 });
 
 app.post("/v1/images/generations", async (c) => {

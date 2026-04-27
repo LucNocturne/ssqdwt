@@ -2,16 +2,19 @@
 
 ## 接口风格
 
-本网关是 **OpenAI Images API 兼容风格**,不是 OpenRouter 风格。
+本网关同时支持两套入口:
+
+1. **OpenAI Images API 兼容入口**: `/v1/images/generations`、`/v1/images/edits`
+2. **OpenRouter 风格兼容入口**: `/api/v1/chat/completions`、`/api/v1/models?output_modalities=image`
 
 相同点:
 - 都使用 `Authorization: Bearer <api_key>`
-- 都使用 `/v1/*` 路径
+- 都使用版本化 API 路径
 - 都用 `model` 字段选择模型/规格
 
 不同点:
 - OpenRouter 主要面向 `chat/completions` 和多模型路由。
-- 本网关面向图片能力,核心接口是 `/v1/images/generations` 和 `/v1/images/edits`。
+- 本网关面向图片能力,原生接口是 `/v1/images/generations` 和 `/v1/images/edits`。
 - `model` 不是 OpenRouter 模型名,而是本网关固定规格名,例如 `img-standard`、`img-1k-1024x1024-low`、`img-4k-3840x2160`。
 
 ## 基础信息
@@ -82,6 +85,100 @@ curl https://qduet.zeabur.app/v1/models \
 | `img-4k-3840x2160` | 3840x2160 | high | 16 | 4K UHD 横屏 |
 
 完整规格见 [model-matrix.md](./model-matrix.md)。
+
+## OpenRouter 风格调用
+
+OpenRouter 风格图片生成走 chat completions:
+
+```text
+POST /api/v1/chat/completions
+```
+
+请求体使用 `messages` 和 `modalities:["image"]`。网关会把最后一条 user message 当作图片 prompt。
+
+curl:
+
+```bash
+curl -X POST https://qduet.zeabur.app/api/v1/chat/completions \
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "img-1k-1024x1024-low",
+    "messages": [
+      {
+        "role": "user",
+        "content": "a red circle on a white background"
+      }
+    ],
+    "modalities": ["image"]
+  }'
+```
+
+也可以用 OpenRouter 常见的 `image_config` 选择尺寸:
+
+```bash
+curl -X POST https://qduet.zeabur.app/api/v1/chat/completions \
+  -H "Authorization: Bearer <GATEWAY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-image-2",
+    "messages": [
+      {
+        "role": "user",
+        "content": "a futuristic city at sunset"
+      }
+    ],
+    "modalities": ["image"],
+    "image_config": {
+      "aspect_ratio": "16:9",
+      "image_size": "2k",
+      "quality": "high"
+    }
+  }'
+```
+
+返回格式:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1777286700,
+  "model": "img-1k-1024x1024-low",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Image generated.",
+        "images": [
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/png;base64,iVBORw0KGgo..."
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 40,
+    "completion_tokens": 196,
+    "total_tokens": 236,
+    "credits": 1,
+    "n": 1
+  }
+}
+```
+
+OpenRouter 风格模型列表:
+
+```bash
+curl "https://qduet.zeabur.app/api/v1/models?output_modalities=image" \
+  -H "Authorization: Bearer <GATEWAY_API_KEY>"
+```
 
 ## 文生图
 
