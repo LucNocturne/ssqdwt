@@ -26,9 +26,9 @@ import { editImage, generateImage, UpstreamError, upstreamMode } from "./upstrea
 
 const MAX_BODY_BYTES = 64 * 1024;
 const editBodyLimit = () =>
-  Number(process.env.MAX_EDIT_BODY_BYTES ?? 25 * 1024 * 1024);
-const MAX_INPUT_IMAGE_BYTES = Number(process.env.MAX_INPUT_IMAGE_BYTES ?? 4 * 1024 * 1024);
-const MAX_INPUT_IMAGES = Number(process.env.MAX_INPUT_IMAGES ?? 4);
+  Number(process.env.MAX_EDIT_BODY_BYTES ?? 200 * 1024 * 1024);
+const MAX_INPUT_IMAGE_BYTES = Number(process.env.MAX_INPUT_IMAGE_BYTES ?? 20 * 1024 * 1024);
+const MAX_INPUT_IMAGES = Number(process.env.MAX_INPUT_IMAGES ?? 10);
 const MAX_PROMPT_BYTES = 32 * 1024;
 const ALLOWED_INPUT_MIME = new Set(["image/png", "image/webp", "image/jpeg"]);
 const imagesEditsEnabled = () => (process.env.IMAGES_EDITS_ENABLED ?? "true") !== "false";

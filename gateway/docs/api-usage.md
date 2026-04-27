@@ -254,13 +254,13 @@ $res = Invoke-RestMethod -Method Post `
 | `model` | string | 是 | 网关模型规格名 |
 | `prompt` | string | 是 | 编辑描述 |
 | `image` | file | 是 | 输入图,单图场景使用 |
-| `image[]` | file[] | 否 | 多参考图,最多 4 张 |
+| `image[]` | file[] | 否 | 多参考图,最多 10 张 |
 | `mask` | file | 否 | PNG 蒙版,必须和 `image[0]` 同尺寸 |
 | `n` | number | 否 | 输出张数,1 到 8,默认 1 |
 
 限制:
-- 总 body 不超过 25 MB
-- 单张输入图不超过 4 MB
+- 总 body 不超过 200 MB
+- 单张输入图不超过 20 MB
 - 输入图格式支持 PNG/JPEG/WEBP
 - mask 只支持 PNG
 - 提供 mask 时,第一张输入图必须是 PNG

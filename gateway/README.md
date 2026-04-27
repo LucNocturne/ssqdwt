@@ -125,7 +125,7 @@ curl -X POST http://127.0.0.1:8787/v1/images/edits \
   -F "prompt=put a yellow star in the masked area" \
   -F "image=@in.png" -F "mask=@mask.png"
 
-# 多参考图(image[] 最多 4 张)
+# 多参考图(image[] 最多 10 张)
 curl -X POST http://127.0.0.1:8787/v1/images/edits \
   -H "Authorization: Bearer sk-img-xxxxx" \
   -F "model=img-standard" \
@@ -134,7 +134,7 @@ curl -X POST http://127.0.0.1:8787/v1/images/edits \
 ```
 
 约束:
-- 总 body ≤ 25 MB,单图 ≤ 4 MB,1..4 张
+- 总 body ≤ 200 MB,单图 ≤ 20 MB,1..10 张
 - image / mask:`image/png` · `image/webp` · `image/jpeg`(mask 必须 png)
 - mask 必须与 image[0] 同尺寸(网关层 PNG header 校验,不解码)
 - 不支持 stream、seed、transparent

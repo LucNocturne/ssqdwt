@@ -8,7 +8,7 @@ set -euo pipefail
 : "${GATEWAY_URL:=http://localhost:8787}"
 : "${GATEWAY_KEY:?GATEWAY_KEY env required (sk-img-...)}"
 : "${MODEL:=img-standard}"
-: "${MAX_INPUT_IMAGE_BYTES:=4194304}"
+: "${MAX_INPUT_IMAGE_BYTES:=20971520}"
 
 OUT=${OUT:-/tmp/smoke-edits}
 mkdir -p "$OUT"

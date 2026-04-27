@@ -77,7 +77,7 @@ describe("performance guardrails", () => {
   });
 
   test("smoke big fixture follows configurable MAX_INPUT_IMAGE_BYTES", () => {
-    expect(smokeEditsSource).toContain(": \"${MAX_INPUT_IMAGE_BYTES:=4194304}\"");
+    expect(smokeEditsSource).toContain(": \"${MAX_INPUT_IMAGE_BYTES:=20971520}\"");
     expect(smokeEditsSource).toContain("MAX_INPUT_IMAGE_BYTES");
     expect(smokeEditsSource).not.toContain("assert size > 4 * 1024 * 1024");
   });
