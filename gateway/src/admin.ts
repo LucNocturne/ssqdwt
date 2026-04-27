@@ -1,7 +1,14 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { adminAuthMiddleware } from "./auth.ts";
-import { createKey, db, findKeyById, rechargeKey, summarizeUsage } from "./db.ts";
+import {
+  configuredGatewayApiKey,
+  createKey,
+  db,
+  findKeyById,
+  rechargeKey,
+  summarizeUsage,
+} from "./db.ts";
 
 export const adminApp = new Hono();
 adminApp.use("*", adminAuthMiddleware);
@@ -12,6 +19,18 @@ const CreateKeyReq = z.object({
 });
 
 adminApp.post("/keys", async (c) => {
+  if (configuredGatewayApiKey()) {
+    return c.json(
+      {
+        error: {
+          type: "fixed_api_key",
+          message: "GATEWAY_API_KEY is configured; use that environment variable as the client API key.",
+        },
+      },
+      409,
+    );
+  }
+
   const body = await c.req.json().catch(() => null);
   const parsed = CreateKeyReq.safeParse(body);
   if (!parsed.success) {

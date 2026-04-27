@@ -5,6 +5,7 @@ import { authMiddleware, requestIdMiddleware } from "./auth.ts";
 import {
   beginRequest,
   completeRequest,
+  ensureGatewayApiKeyFromEnv,
   failRequest,
   findKeyById,
   insertUsageLog,
@@ -27,6 +28,13 @@ const MAX_INPUT_IMAGES = Number(process.env.MAX_INPUT_IMAGES ?? 4);
 const MAX_PROMPT_BYTES = 32 * 1024;
 const ALLOWED_INPUT_MIME = new Set(["image/png", "image/webp", "image/jpeg"]);
 const imagesEditsEnabled = () => (process.env.IMAGES_EDITS_ENABLED ?? "true") !== "false";
+
+const gatewayApiKey = ensureGatewayApiKeyFromEnv();
+if (gatewayApiKey) {
+  console.log(
+    `gateway api key ready id=${gatewayApiKey.id} prefix=${gatewayApiKey.prefix} created=${gatewayApiKey.created}`,
+  );
+}
 
 const app = new Hono();
 app.use("*", requestIdMiddleware);

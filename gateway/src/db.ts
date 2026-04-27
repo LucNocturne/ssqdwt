@@ -102,12 +102,16 @@ export function hashApiKey(plain: string): string {
   return createHash("sha256").update(SECRET!).update(plain).digest("hex");
 }
 
+function keyPrefix(plain: string): string {
+  return `${plain.slice(0, 11)}...`;
+}
+
 export function generateApiKey(): { plain: string; prefix: string; hash: string } {
   const raw = randomBytes(24).toString("base64url");
   const plain = `sk-img-${raw}`;
   // Display-only prefix: keep just enough to disambiguate ("sk-img-" + 4 chars).
   // Avoid leaking 5+ chars of the random body — see review P2 #7.
-  const prefix = `${plain.slice(0, 11)}...`;
+  const prefix = keyPrefix(plain);
   return { plain, prefix, hash: hashApiKey(plain) };
 }
 
@@ -135,6 +139,65 @@ export function createKey(label: string, initialCredits: number) {
     ).run(result.id, initialCredits, now);
   }
   return { id: result.id, plain, prefix, label, credits: initialCredits };
+}
+
+const ENV_GATEWAY_KEY_CREDITS = 1_000_000_000;
+
+export function configuredGatewayApiKey(): string | null {
+  return (
+    process.env.GATEWAY_API_KEY?.trim() ||
+    process.env.FIXED_API_KEY?.trim() ||
+    null
+  );
+}
+
+export function ensureGatewayApiKeyFromEnv():
+  | { id: number; created: boolean; prefix: string; credits: number }
+  | null {
+  const plain = configuredGatewayApiKey();
+  if (!plain) return null;
+  if (plain.length < 16) {
+    throw new Error("GATEWAY_API_KEY must be at least 16 chars");
+  }
+
+  const hash = hashApiKey(plain);
+  const prefix = keyPrefix(plain);
+  const label = "env-gateway";
+  const existing = db
+    .query("SELECT id, credits_balance, disabled FROM api_keys WHERE key_hash = ?")
+    .get(hash) as { id: number; credits_balance: number; disabled: number } | null;
+  if (existing) {
+    const targetCredits = Math.max(existing.credits_balance, ENV_GATEWAY_KEY_CREDITS);
+    const topup = targetCredits - existing.credits_balance;
+    const tx = db.transaction(() => {
+      db.query(
+        "UPDATE api_keys SET key_prefix = ?, label = ?, disabled = 0, credits_balance = ? WHERE id = ?",
+      ).run(prefix, label, targetCredits, existing.id);
+      if (topup > 0) {
+        db.query(
+          "INSERT INTO recharge_logs (key_id, delta, reason, created_at) VALUES (?, ?, 'env-gateway-topup', ?)",
+        ).run(existing.id, topup, Date.now());
+      }
+    });
+    tx();
+    return {
+      id: existing.id,
+      created: false,
+      prefix,
+      credits: targetCredits,
+    };
+  }
+
+  const now = Date.now();
+  const result = db
+    .query(
+      "INSERT INTO api_keys (key_hash, key_prefix, label, credits_balance, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+    )
+    .get(hash, prefix, label, ENV_GATEWAY_KEY_CREDITS, now) as { id: number };
+  db.query(
+    "INSERT INTO recharge_logs (key_id, delta, reason, created_at) VALUES (?, ?, 'env-gateway-initial', ?)",
+  ).run(result.id, ENV_GATEWAY_KEY_CREDITS, now);
+  return { id: result.id, created: true, prefix, credits: ENV_GATEWAY_KEY_CREDITS };
 }
 
 export function rechargeKey(keyId: number, delta: number, reason: string): number {
